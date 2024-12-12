@@ -89,6 +89,7 @@ class ProxmoxImport(Script):
         try:
             prox_secret = Secret.objects.get(role=secret_role, assigned_object_id=host_dev.id)
         except:
+            self.log_warning(f"Не задан токен устройства '{host_dev.name}'")
             return None		# нет девайса/нет токена для работы
         try:
             prox_secret.decrypt(masterkey)
@@ -836,6 +837,7 @@ class ProxmoxImport(Script):
             return
         self.log_info(f"Проверяем IP: {ip_list[0]} - {ip_list[-1]}")
 
+# основной цикл - перебираем адреса
         for addr in ip_list:
             if str(addr.status).lower() != 'active':	# все активные адреса из списка
                 continue
@@ -850,6 +852,8 @@ class ProxmoxImport(Script):
 # ищем в базе/создаем устройство
             s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr, 
                                     d_role=dev_role, d_type=script_dev_type, set_tag=script_tag)
+            if not s_dev:
+                continue
 # пытаемся подключиться к Proxmox
             prox = self.connect(addr, s_dev, m_key, script_s_role)
             if not prox:

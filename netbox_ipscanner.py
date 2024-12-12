@@ -4,7 +4,7 @@ from ipam.models import Prefix, IPAddress
 from extras.models import Tag
 from extras.scripts import Script, BooleanVar, StringVar, ObjectVar
 
-nmap_arguments = '-sP -PE -PU -PS22,23,80,139,443,515,3389,8006,9100 -T3 --send-ip --release-memory'
+nmap_arguments = '-sP -PE -PP -PU137,161 -PS22,80,139,443,515,3389,9100 -T4 --send-ip --release-memory'
 #nmap_arguments = '-sn -PE -PP -PS21,22,23,25,80,113,443,31339 -PA80,113,443,10042 -T4 --source-port 53'        # рекомендовано nmap-docs
 #nmap_arguments = '-sn --send-ip -PR -PP -T2 --source-port 53'                  # длинные таймауты - находит почти всё (долго)
 
