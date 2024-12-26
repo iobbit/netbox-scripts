@@ -266,7 +266,7 @@ class ProxmoxImport(Script):
         try:
             c_node = Device.objects.get(site=site, name=name)	# проверка наличия устройства (безымянные допускаются)
         except:
-            if commit:
+            if commit and name:		# создавать безымянные не будем
                 self.log_success(f"Нет устройства '{name}', создаем.")
                 c_node = Device(
                     name = name,
@@ -314,8 +314,8 @@ class ProxmoxImport(Script):
             dev.description = description
         dev.full_clean()
         if ip4 and ip4 != dev.primary_ip4:
-            dev.primary_ip4 = ip4	# после проверки, т.к. интерфейс может еще не существовать
             u_str.append(f"ip4={str(ip4)}")
+            dev.primary_ip4 = ip4	# после проверки, т.к. интерфейс может еще не существовать
         self.log_success(f"Обновляем устройство {dev.name}: {', '.join(u_str)}")
         dev.save()
         return True
@@ -779,7 +779,7 @@ class ProxmoxImport(Script):
             node_status = prox.nodes(node['node']).status.get()
         except:
             self.log_warning(f"Ошибка запроса (недостаточные привилегии токена)!")
-            return result
+            return {'name':node_dev.name}
 #        self.log_debug(f"Node {node['node']}: {node_status}")
         self.make_dev_ifaces(commit, prox, node, node_dev, set_tag=set_tag)
 # теперь обновляем хост (статус всегда 'online')
@@ -841,18 +841,25 @@ class ProxmoxImport(Script):
         for addr in ip_list:
             if str(addr.status).lower() != 'active':	# все активные адреса из списка
                 continue
+            s_name=addr.dns_name.split('.')[0]		# выбираем хост по DNS-адресу
+# проверяем порты Proxmox
             ip4 = str(addr).split('/')[0]
             if self.is_port_open(ip4, PVE_DEFAULT_PORT):
                 dev_role = script_dev_role_pve
             elif self.is_port_open(ip4, PBS_DEFAULT_PORT):
                 dev_role = script_dev_role_pbs
             else:
+# ищем в базе устройство
+                s_dev = self.get_device(False, name=s_name, site=def_site)
+                if s_dev:		# в списке есть, но не отвечает
+#                    self.log_debug(f"Device '{s_dev.name}' is offline.")
+                    self.update_device(commit, s_dev, status=DeviceStatusChoices.STATUS_OFFLINE)
                 continue		# прочие сервисы игнорируем
-            s_name=addr.dns_name.split('.')[0]		# выбираем хост по DNS-адресу
-# ищем в базе/создаем устройство
-            s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr, 
+# создаем/обновляем устройство
+            s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr,
+                                    status=DeviceStatusChoices.STATUS_ACTIVE,
                                     d_role=dev_role, d_type=script_dev_type, set_tag=script_tag)
-            if not s_dev:
+            if not s_dev:		# создать не удалось?
                 continue
 # пытаемся подключиться к Proxmox
             prox = self.connect(addr, s_dev, m_key, script_s_role)
