@@ -1,7 +1,10 @@
-# минимальная версия Netbox 4.1
+# минимальная версия Netbox 4.2
+#
+# v4.2 - добавлена поддержка объектов MACAddress
+# v4.1 - использовано поле VirtualMachine.serial для номера Proxmox VMid
 
 import re
-import requests		# для proxmoxer и username
+import requests		# для proxmoxer и определения 'username' в http-запросе
 import socket		# для проверки соединения по IP
 from proxmoxer import ProxmoxAPI
 
@@ -14,7 +17,7 @@ from extras.models import Tag
 from virtualization.models import ClusterType, Cluster, VirtualMachine, VMInterface
 from virtualization.choices import VirtualMachineStatusChoices
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices
-from dcim.models import Interface,Device,DeviceRole,DeviceType,Manufacturer,Site
+from dcim.models import Interface,MACAddress,Device,DeviceRole,DeviceType,Manufacturer,Site
 from ipam.models import Prefix, IPAddress
 
 # должен быть установлен плагин netbox_secrets
@@ -61,7 +64,7 @@ class ProxmoxImport(Script):
 
     key_file = FileVar(
         required=True,
-        description="Загрузите файл приватного ключа",
+        description="Загрузите файл приватного ключа для доступа к секретам",
     )
 
 
@@ -330,8 +333,8 @@ class ProxmoxImport(Script):
                     device = dev,
                     name = name,
                     type = iface_type,
-                    mac_address = mac,
                     mtu = mtu,
+#                    mac_address = mac,         # Proxmox не показывает MAC для интерфейсов хоста - не используем
                     enabled = iface_enabled,
                     bridge = bridge_iface,
                     description = f"Создано скриптом '{self.Meta.name}'",
@@ -349,7 +352,7 @@ class ProxmoxImport(Script):
 
     def update_dev_iface(self, commit, iface, iface_mac, iface_mtu, iface_enabled, iface_bridge):
         upd = False
-        upd = upd or (iface_mac and iface_mac.lower() != iface.mac_address)
+#        upd = upd or (iface_mac and iface_mac.lower() != iface.mac_address)
         upd = upd or (str(iface_mtu) != str(iface.mtu))
         upd = upd or (bool(iface_enabled) != iface.enabled)
         upd = upd or (iface_bridge != iface.bridge)
@@ -358,9 +361,9 @@ class ProxmoxImport(Script):
         u_str =[]
         if iface.pk and hasattr(iface, 'snapshot'):
             iface.snapshot()		# запись для истории изменений
-        if iface_mac and iface_mac.lower() != iface.mac_address:
-            u_str.append(f"MAC={iface_mac}")
-            iface.mac_address = iface_mac
+#        if iface_mac and iface_mac.lower() != iface.mac_address:
+#            u_str.append(f"MAC={iface_mac}")
+#            iface.mac_address = iface_mac
         if (str(iface_mtu) != str(iface.mtu)):
             u_str.append(f"MTU={iface_mtu}")
             iface.mtu = iface_mtu
@@ -416,6 +419,7 @@ class ProxmoxImport(Script):
         ip_address.save()
         return True
 
+# поиск/создание/обновление виртуальной машины
     def get_vm(self, commit, name, status, v_cluster, v_role=None, serial=None, cpus=0, mem=0, disk=0,
                     set_tag=None, description=None):
         try:
@@ -511,7 +515,7 @@ class ProxmoxImport(Script):
                     vdev.save()
             return vdev.primary_ip4
         elif commit and len(vm_ip_list) > 1 and not vdev.primary_ip4:
-            self.log_warning(f"У ВМ id={vdev.id} '{vdev.name}' несколько адресов, primary адрес надо выбрать вручную.")
+            self.log_warning(f"У ВМ id={vdev.id} '{vdev.name}' несколько IP-адресов, Primary адрес надо выбрать вручную.")
         return None
 
 # разбор строки описания носителя. Пример: 'sas_vm:vm-152-disk-0,size=120G'
@@ -561,24 +565,24 @@ class ProxmoxImport(Script):
         for attribute in ('hwaddr', 'virtio', 'e1000', 'e1000e', 'rtl8139', 'vmxnet3'):
             if attribute in net_config:
                 iface_mac = net_config[attribute]
+                break
         iface_name = net_config['name'] if 'name' in net_config else \
                     self.parse_agent_netinfo(net_info, iface_mac, 'name') or net_dev
         iface_mtu = net_config['mtu'] if 'mtu' in net_config else None
         iface_enabled = (not net_config['link_down']) if 'link_down' in net_config else True
-# в Netbox атрибуты интерфейса parent и bridge должны быть в той же вирт.машине - не используем
+# в Netbox атрибуты интерфейса parent и bridge должны быть в той же вирт.машине - не используем, пишем в description
         iface_bridge = net_config['bridge'] if 'bridge' in net_config else ''
 # список IPv4 для привязки к интерфейсу
         ip4 = [net_config['ip']] if 'ip' in net_config else self.parse_agent_netinfo(net_info, iface_mac, 'ip')
 #        self.log_debug(f"VMInterface: {iface_name}: {iface_mac}, {iface_mtu}, {iface_enabled}, {iface_bridge}, {ip4}")
         try:
-            n_iface = VMInterface.objects.get(virtual_machine=vm, mac_address=iface_mac)	# проверка наличия интерфейса
+            n_iface = VMInterface.objects.get(virtual_machine=vm, name=iface_name)	# проверка наличия интерфейса
         except:
             if commit:
                 self.log_success(f"Нет интерфейса ВМ '{iface_name}', создаем.")
                 n_iface = VMInterface(
                     virtual_machine = vm,
                     name = iface_name,
-                    mac_address = iface_mac,
                     mtu = iface_mtu,
                     enabled = iface_enabled,
                     description = self.make_vm_iface_description(iface_bridge),
@@ -590,8 +594,11 @@ class ProxmoxImport(Script):
             else:
                 return None
         else:
-            self.update_vm_iface(commit, n_iface, iface_name, iface_mac, iface_mtu, iface_enabled, iface_bridge)
+            self.update_vm_iface(commit, n_iface, iface_name, iface_mtu, iface_enabled, iface_bridge)
 #        self.log_debug(f"VMInterface ID: {n_iface.id}")
+        if iface_mac:
+#            self.log_debug(f"Link VM iface ID:{n_iface.id} -> MAC={iface_mac}")
+            self.update_mac(commit, n_iface, iface_mac, set_tag)
         if ip4:
 #            self.log_debug(f"Link iface ID:{n_iface.id} -> IP={ip4}")
             for ip in ip4:
@@ -603,7 +610,7 @@ class ProxmoxImport(Script):
 #        return f"{v_bridge}Создано скриптом '{self.Meta.name}'"
         return v_bridge
 
-# поиск атрибута в описании сети от qemu-агента
+# поиск нужного атрибута в описании сети от qemu-агента
     def parse_agent_netinfo(self, net_info, mac, attr):
         if not (net_info and mac):
             return None
@@ -614,17 +621,17 @@ class ProxmoxImport(Script):
                 return vm_interface['name']
             elif attr=='ip':
                 iface_ip_list = []
-                for ip in vm_interface['ip-addresses']:		# собираем адреса интерфейса
+                for ip in vm_interface['ip-addresses']:		# собираем IP-адреса интерфейса
                     if ip['ip-address-type'] == 'ipv4':		# пропускаем IPv6
                         iface_ip_list.append(f"{ip['ip-address']}/{ip['prefix']}")
 # возвращаем список
                 return iface_ip_list
         return None
 
-    def update_vm_iface(self, commit, iface, iface_name, iface_mac, iface_mtu, iface_enabled, iface_bridge):
+    def update_vm_iface(self, commit, iface, iface_name, iface_mtu, iface_enabled, iface_bridge):
         upd = False
         upd = upd or (iface_name and iface_name != iface.name)
-        upd = upd or (iface_mac and iface_mac.lower() != iface.mac_address)
+#        upd = upd or (iface_mac and iface_mac.lower() != iface.mac_address)
         upd = upd or (iface_mtu and int(iface_mtu) != iface.mtu) or (not iface_mtu and iface.mtu)
         upd = upd or (bool(iface_enabled) != iface.enabled)
         upd = upd or (iface.description != self.make_vm_iface_description(iface_bridge))
@@ -635,8 +642,6 @@ class ProxmoxImport(Script):
             iface.snapshot()		# запись для истории изменений
         if iface_name:
             iface.name = iface_name
-        if iface_mac:
-            iface.mac_address = iface_mac
         if iface_mtu:
             iface.mtu = int(iface_mtu)
         else:
@@ -645,6 +650,65 @@ class ProxmoxImport(Script):
         iface.description = self.make_vm_iface_description(iface_bridge)
         iface.full_clean()
         iface.save()
+        return True
+
+# создание MAC-адреса
+    def make_MAC(self, macaddr, set_tag=None):
+        self.log_success(f"Нет MAC-адреса '{macaddr}', создаем.")
+        mac = MACAddress(
+            mac_address = macaddr,
+            description = f"Создано скриптом '{self.Meta.name}'",
+            )
+        mac.full_clean()
+        mac.save()
+        if set_tag:
+            mac.tags.add(set_tag)		# теги после создания объекта
+#        self.log_debug(f"MAC: {mac.mac_address}, pk: {mac.pk}")
+        return mac
+
+# поиск MAC-адреса для определенного интерфейса
+    def get_MAC(self, commit, iface, macaddr, set_tag=None):
+#        self.log_debug(f"Поиск MAC-адреса {macaddr} для интерфейса id={iface.id} '{iface.name}'")
+        mac_list = MACAddress.objects.filter(mac_address=macaddr)	# выбираем все сразу
+        if len(mac_list)==0:
+            if commit:
+                return self.make_MAC(macaddr, set_tag)
+        else:
+            for mac in mac_list:
+                if mac.assigned_object_id == iface.id:	# нашли уже привязанный
+                    return mac
+            for mac in mac_list:
+                if not mac.assigned_object:		# нашли свободный
+                    return mac
+            if commit:
+                return self.make_MAC(macaddr, set_tag)	# все заняты - делаем новый
+        return None
+
+# привязка MAC-адреса к интерфейсу виртуальной машины
+    def update_mac(self, commit, iface, iface_mac, set_tag):
+        mac_address = self.get_MAC(commit, iface, iface_mac, set_tag)
+        if not mac_address:
+            self.log_warning(f"MAC-адрес {iface_mac} для интерфейса {iface.id} '{iface.name}' не найден!")
+            return False
+        interface_ct = ContentType.objects.get_for_model(VMInterface).pk
+        upd = (mac_address.assigned_object_type_id != interface_ct) or (mac_address.assigned_object_id != iface.id)
+        if (not commit):
+            return not upd
+        if upd:
+            self.log_success(f"Связка MAC-адреса {iface_mac} -> interface {iface.id} '{iface.name}'")
+            if mac_address.pk and hasattr(mac_address, 'snapshot'):
+                mac_address.snapshot()		# запись для истории изменений
+            mac_address.assigned_object_type_id = interface_ct
+            mac_address.assigned_object_id = iface.id
+            mac_address.full_clean()
+            mac_address.save()
+# делаем MAC первичным в любом случае (у нас только по одному MAC-у на интерфейс)
+        if iface.primary_mac_address != mac_address:
+#            self.log_success(f"Обновляем primary MAC-адрес интерфейса {iface.id} '{iface.name}' -> {mac_address}")
+            if iface.pk and hasattr(iface, 'snapshot'):
+                iface.snapshot()		# запись для истории изменений
+            iface.primary_mac_address = mac_address
+            iface.save()
         return True
 
     def make_dev_ifaces(self, commit, prox, node, node_dev, set_tag):
@@ -657,7 +721,7 @@ class ProxmoxImport(Script):
             i_mtu = iface['mtu'] if 'mtu' in iface else None
             i_bridge = None
             if iface['type'] == 'eth':
-                i_type = InterfaceTypeChoices.TYPE_1GE_TX_FIXED
+                i_type = IFACE_DEFAULT_TYPE
 #                self.log_debug(f"Ethernet {iface['iface']}: active={i_status}, mtu={i_mtu}")
             elif iface['type'] == 'bridge':
                 i_type = InterfaceTypeChoices.TYPE_BRIDGE
@@ -787,7 +851,7 @@ class ProxmoxImport(Script):
                     description=f"Proxmox BS {prox.version.get()['version']}, cpu={node_status['cpuinfo']['cpus']}, mem={int(int(node_status['memory']['total'])/1024**3)} GiB")
         return {'name':node_dev.name}
 
-
+################################################################################
 # основной модуль
 
     def run(self, data, commit):
@@ -854,7 +918,7 @@ class ProxmoxImport(Script):
                 if s_dev:		# в списке есть, но не отвечает
 #                    self.log_debug(f"Device '{s_dev.name}' is offline.")
                     self.update_device(commit, s_dev, status=DeviceStatusChoices.STATUS_OFFLINE)
-                continue		# прочие сервисы игнорируем
+                continue		# прочие сервисы на этом адресе игнорируем
 # создаем/обновляем устройство
             s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr,
                                     status=DeviceStatusChoices.STATUS_ACTIVE,
