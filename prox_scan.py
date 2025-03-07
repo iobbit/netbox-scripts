@@ -157,7 +157,7 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Cluster type ID: {c_type.id}")
         return c_type
 
-    def get_cluster(self, commit, name, c_type, site, set_tag=None, description=None):
+    def get_cluster(self, commit, name, c_type, set_tag=None, description=None):
         try:
             c_clust = Cluster.objects.get(name=name)	# проверка наличия кластера
         except:
@@ -166,7 +166,6 @@ class ProxmoxImport(Script):
                 c_clust = Cluster(
                     name = name,
                     type = c_type,
-                    site = site,
                     description = description,
                     comments = f"Создано скриптом '{self.Meta.name}'",
                     )
@@ -751,7 +750,7 @@ class ProxmoxImport(Script):
         cluster_type = self.get_cluster_type(commit, set_tag=set_tag)
 #        self.log_info(f"Cluster {cluster_name}  status: {prox.cluster.status.get()}")
 #        self.log_info(f"Cluster {cluster_name} options: {prox.cluster.options.get()}")
-        cluster = self.get_cluster(commit, cluster_name, cluster_type, site, 
+        cluster = self.get_cluster(commit, cluster_name, cluster_type,
                                     set_tag=set_tag, description=prox.cluster.options.get()['description'])
         if not cluster:		# не удалось создать кластер?
             return result
@@ -858,7 +857,7 @@ class ProxmoxImport(Script):
 
 # подготовка нужных объектов
         def_site = data['select_site']
-#        self.log_debug(f"Site ID: {def_site.id}")
+#        self.log_debug(f"Site ID: {def_site.id} '{def_site.name}'")
         script_tag = self.get_tag_auto(commit)
         script_manuf = self.get_manufacturer(commit, set_tag=script_tag)	# имя по умолчанию
         script_dev_type = self.get_device_type(commit, set_manufacturer=script_manuf, set_tag=script_tag)
@@ -915,21 +914,23 @@ class ProxmoxImport(Script):
             else:
 # ищем в базе устройство
                 s_dev = self.get_device(False, name=s_name, site=def_site)
-                if s_dev:		# в списке есть, но не отвечает
+                if s_dev:		# в списке есть, но Proxmox не отвечает
 #                    self.log_debug(f"Device '{s_dev.name}' is offline.")
                     self.update_device(commit, s_dev, status=DeviceStatusChoices.STATUS_OFFLINE)
                 continue		# прочие сервисы на этом адресе игнорируем
-# создаем/обновляем устройство
+# создаем устройство
             s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr,
                                     status=DeviceStatusChoices.STATUS_ACTIVE,
                                     d_role=dev_role, d_type=script_dev_type, set_tag=script_tag)
             if not s_dev:		# создать не удалось?
                 continue
+# обновляем устройство
+            self.update_device(commit, s_dev, d_role=dev_role, ip4=addr, status=DeviceStatusChoices.STATUS_ACTIVE)
 # пытаемся подключиться к Proxmox
             prox = self.connect(addr, s_dev, m_key, script_s_role)
             if not prox:
                 continue
-# смотрим Proxmox и обновляем устройства
+# смотрим инфу Proxmox и обновляем хосты, интерфейсы, ВМ и прочее
             prox_version = prox.version.get()['version']
             self.log_info(f"Анализ {prox._backend.auth.service} {prox_version} по адресу: {str(addr)}")
             if prox._backend.auth.service==DEVICE_ROLE_PVE:
