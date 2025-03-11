@@ -10,7 +10,7 @@ from proxmoxer import ProxmoxAPI
 
 from django.contrib.contenttypes.models import ContentType
 
-from utilities.exceptions import AbortScript
+from netbox.choices import ColorChoices
 from extras.scripts import Script, ObjectVar, FileVar
 from users.models import User
 from extras.models import Tag
@@ -20,11 +20,17 @@ from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices
 from dcim.models import Interface,MACAddress,Device,DeviceRole,DeviceType,Manufacturer,Site
 from ipam.models import Prefix, IPAddress
 
-# должен быть установлен плагин netbox_secrets
-from netbox_secrets.models import SecretRole,Secret,UserKey
+# должен быть установлен плагин 'netbox_secrets'
+try:
+    from netbox_secrets.models import SecretRole,Secret,UserKey
+    PROX_SECRET_ROLE = 'proxmox_token'	# роль секретов для доступа к Proxmox
+except ImportError:
+    PROX_SECRET_ROLE = ''		# без доступа к Proxmox API
 
-# цвет для создаваемых объектов Tag и DeviceRole
-PROX_COLOR = '673ab7'
+# цвет для создаваемых объектов
+PROX_TAG_COLOR = ColorChoices.COLOR_INDIGO
+PROX_COLOR_PVE = ColorChoices.COLOR_DARK_PURPLE
+PROX_COLOR_PBS = ColorChoices.COLOR_PURPLE
 
 # имена для автоматически добавляемых скриптом объектов
 TAG_AUTO = 'prox_scan'		# метка
@@ -32,13 +38,16 @@ CLUSTER_TYPE = 'Proxmox'	# тип кластеров
 DEVICE_TYPE = 'ProxScan'	# тип устройств
 DEVICE_ROLE_PVE = 'PVE'		# роль устройств P.Virtual Environment
 DEVICE_ROLE_PBS = 'PBS'		# роль устройств P.Backup Server
-MANUFACTURER = 'ProxScan'	# производитель
-VM_DEFAULT_ROLE = 'server'		# роль по умолч. для вирт.машин
-PROX_SECRET_ROLE = 'proxmox_token'	# роль секретов для доступа к proxmox
+MANUFACTURER = 'ProxScan'	# условный изготовитель
+VM_DEFAULT_ROLE = 'server'	# роль по умолчанию для вирт.машин
 
+# тип для физических интерфейсов
 IFACE_DEFAULT_TYPE = InterfaceTypeChoices.TYPE_1GE_TX_FIXED
 # TYPE_10GE_SFP_PLUS
-# TYPE_VIRTUAL, TYPE_BRIDGE, TYPE_LAG
+# типы для виртуальных интерфейсов
+IFACE_VIRTUAL_TYPE = InterfaceTypeChoices.TYPE_VIRTUAL
+IFACE_BRIDGE_TYPE = InterfaceTypeChoices.TYPE_BRIDGE
+#IFACE_LAG_TYPE = InterfaceTypeChoices.TYPE_LAG
 
 PVE_DEFAULT_PORT = 8006
 PBS_DEFAULT_PORT = 8007
@@ -63,8 +72,8 @@ class ProxmoxImport(Script):
     )
 
     key_file = FileVar(
-        required=True,
-        description="Загрузите файл приватного ключа для доступа к секретам",
+        required=False,
+        description="Загрузите файл приватного ключа для доступа к API Proxmox",
     )
 
 
@@ -78,6 +87,8 @@ class ProxmoxImport(Script):
 
 # установка соединения с хостом Proxmox с использованием токена
     def connect(self, server_addr, host_dev, masterkey, secret_role):
+        if not masterkey:		# нет доступа к API
+            return None
         ip4 = str(server_addr).split('/')[0]
         if self.is_port_open(ip4, PVE_DEFAULT_PORT):
             dev_port = PVE_DEFAULT_PORT
@@ -97,7 +108,7 @@ class ProxmoxImport(Script):
         try:
             prox_secret.decrypt(masterkey)
         except:
-            self.log_failure(f"Неверный файл ключа!")
+            self.log_failure(f"Несоответствующий файл ключа!")
             return None
 # соединение с API
 #        self.log_debug(f"Check {prox_service} API at: {host_dev.name}={ip4}:{dev_port} with token {prox_secret.name}={prox_secret.plaintext}")
@@ -120,21 +131,21 @@ class ProxmoxImport(Script):
 # поиск/создание объекта Tag нужного вида
     def get_tag_auto(self, commit, name=TAG_AUTO):
         try:
-            a_tag = Tag.objects.get(name=name)	# проверка наличия тега
+            a_tag = Tag.objects.get(name=name)	# поиск тега
         except:
             if commit:
                 self.log_success(f"Нет тега '{name}', создаем.")
                 a_tag = Tag(
                     name = name,
                     slug = name.lower(),
-                    color = PROX_COLOR,
-                    description = f"Для объектов, созданных скриптом '{self.Meta.name}'",
+                    color = PROX_TAG_COLOR,
+                    description = f"Метка для объектов, созданных скриптом '{self.Meta.name}'",
                     )
                 a_tag.full_clean()
                 a_tag.save()
             else:
                 return None
-#        self.log_debug(f"Tag ID: {a_tag.id}")
+#        self.log_debug(f"Tag ID: {a_tag.id}", a_tag)
         return a_tag
 
     def get_cluster_type(self, commit, name=CLUSTER_TYPE, set_tag=None):
@@ -220,7 +231,9 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Device type ID: {d_type.id}")
         return d_type
 
-    def get_secret_role(self, commit, name=PROX_SECRET_ROLE, set_tag=None):
+    def get_secret_role(self, commit, name, set_tag=None):
+        if not name:
+            return None
         try:
             s_role = SecretRole.objects.get(name=name)	# проверка наличия роли секретов
         except:
@@ -249,7 +262,7 @@ class ProxmoxImport(Script):
                 self.log_success(f"Нет роли устройств '{name}', создаем.")
                 d_role = DeviceRole(
                     name = name,
-                    color = PROX_COLOR,
+                    color = PROX_COLOR_PVE if name==DEVICE_ROLE_PVE else PROX_COLOR_PBS,
                     slug = name.lower(),
                     description = f"Создано скриптом '{self.Meta.name}'",
                     )
@@ -317,8 +330,8 @@ class ProxmoxImport(Script):
         dev.full_clean()
         if ip4 and ip4 != dev.primary_ip4:
             u_str.append(f"ip4={str(ip4)}")
-            dev.primary_ip4 = ip4	# после проверки, т.к. интерфейс может еще не существовать
-        self.log_success(f"Обновляем устройство {dev.name}: {', '.join(u_str)}")
+            dev.primary_ip4 = ip4	# после проверки
+        self.log_success(f"Обновляем устройство {dev.name}: {', '.join(u_str)}", dev)
         dev.save()
         return True
 
@@ -385,8 +398,8 @@ class ProxmoxImport(Script):
 #            self.log_debug(f"IP: {ip_address.address}, Name: {ip_address.dns_name}")
             return ip_address
         except IPAddress.DoesNotExist:
-            self.log_success(f"Нет адреса '{ipn}', создаем.")
             if commit:
+                self.log_success(f"Нет адреса '{ipn}', создаем.")
                 ip_address = IPAddress(
                     address = ipn,
                     description = f"Создано скриптом '{self.Meta.name}'",
@@ -409,7 +422,7 @@ class ProxmoxImport(Script):
         upd = (ip_address.assigned_object_type_id != interface_ct) or (ip_address.assigned_object_id != iface.id)
         if (not commit) or (not upd):
             return False
-        self.log_success(f"Связка адреса {ip4} -> interface {iface.id} '{iface.name}' dev.real={real}")
+        self.log_success(f"Связка адреса {ip4} -> interface {iface.id} '{iface.name}' dev.real={real}", iface)
         if ip_address.pk and hasattr(ip_address, 'snapshot'):
             ip_address.snapshot()		# запись для истории изменений
         ip_address.assigned_object_type_id = interface_ct
@@ -505,13 +518,12 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"VM id: {vdev.id}, IP: {vm_ip_list}")
         if len(vm_ip_list)==1:
             ip_prim = IPAddress.objects.get(address=vm_ip_list[0])
-            if vdev.primary_ip4 != ip_prim:
+            if commit and (vdev.primary_ip4 != ip_prim):
                 self.log_success(f"Обновляем primary адрес VM {vdev.id} '{vdev.name}' -> {ip_prim}")
-                if commit:
-                    if vdev.pk and hasattr(vdev, 'snapshot'):
-                        vdev.snapshot()		# запись для истории изменений
-                    vdev.primary_ip4 = ip_prim
-                    vdev.save()
+                if vdev.pk and hasattr(vdev, 'snapshot'):
+                    vdev.snapshot()		# запись для истории изменений
+                vdev.primary_ip4 = ip_prim
+                vdev.save()
             return vdev.primary_ip4
         elif commit and len(vm_ip_list) > 1 and not vdev.primary_ip4:
             self.log_warning(f"У ВМ id={vdev.id} '{vdev.name}' несколько IP-адресов, Primary адрес надо выбрать вручную.")
@@ -723,12 +735,12 @@ class ProxmoxImport(Script):
                 i_type = IFACE_DEFAULT_TYPE
 #                self.log_debug(f"Ethernet {iface['iface']}: active={i_status}, mtu={i_mtu}")
             elif iface['type'] == 'bridge':
-                i_type = InterfaceTypeChoices.TYPE_BRIDGE
+                i_type = IFACE_BRIDGE_TYPE
                 if 'bridge_ports' in iface:		# ищем порт - должен уже существовать для привязки
                     i_bridge = self.get_iface(False, node_dev, iface['bridge_ports'])
 #                self.log_debug(f"Bridge {iface['iface']}: bridge_ports={i_bridge}, active={i_status}, mtu={i_mtu}")
             else:
-                i_type = InterfaceTypeChoices.TYPE_VIRTUAL
+                i_type = IFACE_VIRTUAL_TYPE
                 self.log_warning(f"Неизвестный тип интерфейса {iface['iface']}: {iface['type']}")
 # делаем/обновляем интерфейс
             dev_iface = self.get_iface(commit, node_dev, iface['iface'], iface_type=i_type,
@@ -837,7 +849,7 @@ class ProxmoxImport(Script):
 # проверка и обновление PBS
     def check_pbs(self, commit, prox, node_dev, host_ip, set_tag):
 #        self.log_debug(f"PBS ping status: {prox.get('ping')}")
-        node = {'node':node_dev.name}			# для совместимости синтаксиса в функции
+        node = {'node':node_dev.name}			# для совместимости в функции make_dev_ifaces
         try:
             node_status = prox.nodes(node['node']).status.get()
         except:
@@ -845,7 +857,7 @@ class ProxmoxImport(Script):
             return {'name':node_dev.name}
 #        self.log_debug(f"Node {node['node']}: {node_status}")
         self.make_dev_ifaces(commit, prox, node, node_dev, set_tag=set_tag)
-# теперь обновляем хост (статус всегда 'online')
+# теперь обновляем хост (статус делаем 'online')
         self.update_device(commit, node_dev, d_role=self.get_device_role(False, name=DEVICE_ROLE_PBS), ip4=host_ip,
                     description=f"Proxmox BS {prox.version.get()['version']}, cpu={node_status['cpuinfo']['cpus']}, mem={int(int(node_status['memory']['total'])/1024**3)} GiB")
         return {'name':node_dev.name}
@@ -859,7 +871,7 @@ class ProxmoxImport(Script):
         def_site = data['select_site']
 #        self.log_debug(f"Site ID: {def_site.id} '{def_site.name}'")
         script_tag = self.get_tag_auto(commit)
-        script_manuf = self.get_manufacturer(commit, set_tag=script_tag)	# имя по умолчанию
+        script_manuf = self.get_manufacturer(commit, set_tag=script_tag)	# условный изготовитель
         script_dev_type = self.get_device_type(commit, set_manufacturer=script_manuf, set_tag=script_tag)
         script_dev_role_pve = self.get_device_role(commit, name=DEVICE_ROLE_PVE, set_tag=script_tag)
         script_dev_role_pbs = self.get_device_role(commit, name=DEVICE_ROLE_PBS, set_tag=script_tag)
@@ -868,27 +880,36 @@ class ProxmoxImport(Script):
         script_s_role = self.get_secret_role(commit, name=PROX_SECRET_ROLE, set_tag=script_tag)
 # проверяем
         if not (def_site and script_tag and script_manuf and script_dev_type and 
-                script_dev_role_pve and script_dev_role_pbs and script_vm_role and script_cluster_type and script_s_role):
+                script_dev_role_pve and script_dev_role_pbs and script_vm_role and script_cluster_type):
             self.log_warning(f"Не созданы необходимые для работы объекты!")
             return
 
+        if script_s_role:
 # Получаем UserKey для текущего пользователя из плагина 'netbox_secrets'
-        username = self.request.user.username
-        my_user = User.objects.get(username=username)
-#        self.log_debug(f"User: {username}, id={my_user.id}")
-        try:
-            my_uk = UserKey.objects.get(user=my_user)
-        except:
-            self.log_warning(f"Не найден секретный ключ пользователя!")
-            return
-#        self.log_debug(f"Active: {my_uk.is_active()}, Key: {my_uk.public_key}")
-
+            username = self.request.user.username
+            my_user = User.objects.get(username=username)
+#            self.log_debug(f"User: {username}, id={my_user.id}")
+            try:
+                my_ukey = UserKey.objects.get(user=my_user)
+#                self.log_debug(f"Active: {my_ukey.is_active()}, Key: {my_ukey.public_key}")
+            except:
+                self.log_warning(f"Не найден секретный ключ пользователя!")
+                my_ukey = None
 # Получаем MasterKey
-#        self.log_debug(f"Key file: {data['key_file'].name} : {data['key_file'].size}")
-        priv_key = data['key_file'].read()
-#        self.log_debug(f"Private_key: {priv_key}")
-        m_key = my_uk.get_master_key(private_key=priv_key)
-#        self.log_debug(f"Master_key: {m_key}")
+            if my_ukey and data['key_file']:
+#                self.log_debug(f"Key file: {data['key_file'].name} : {data['key_file'].size}")
+                priv_key = data['key_file'].read()
+#                self.log_debug(f"Private_key: {priv_key}")
+                m_key = my_ukey.get_master_key(private_key=priv_key)
+#                self.log_debug(f"Master_key: {m_key}")
+                if not m_key:
+                    self.log_failure(f"Несоответствующий файл ключа!")
+            else:
+                self.log_warning(f"Не загружен секретный ключ, нет доступа к Proxmox API.")
+                m_key = None
+        else:
+            self.log_warning(f"Не установлен плагин 'netbox_secrets', нет доступа к Proxmox API.")
+            m_key = None
 
 # составляем список проверяемых адресов
         ip_list = []
@@ -925,7 +946,7 @@ class ProxmoxImport(Script):
             if not s_dev:		# создать не удалось?
                 continue
 # обновляем устройство
-            self.update_device(commit, s_dev, d_role=dev_role, ip4=addr, status=DeviceStatusChoices.STATUS_ACTIVE)
+            self.update_device(commit, s_dev, d_role=dev_role, status=DeviceStatusChoices.STATUS_ACTIVE)
 # пытаемся подключиться к Proxmox
             prox = self.connect(addr, s_dev, m_key, script_s_role)
             if not prox:
