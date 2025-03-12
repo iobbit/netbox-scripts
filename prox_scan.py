@@ -32,10 +32,11 @@ PROX_TAG_COLOR = ColorChoices.COLOR_INDIGO
 PROX_COLOR_PVE = ColorChoices.COLOR_DARK_PURPLE
 PROX_COLOR_PBS = ColorChoices.COLOR_PURPLE
 
-# имена для автоматически добавляемых скриптом объектов
+# значения для автоматически добавляемых скриптом объектов
 TAG_AUTO = 'prox_scan'		# метка
 CLUSTER_TYPE = 'Proxmox'	# тип кластеров
 DEVICE_TYPE = 'ProxScan'	# тип устройств
+DEVICE_HEIGHT = 2.0		# высота устройств по умолчанию
 DEVICE_ROLE_PVE = 'PVE'		# роль устройств P.Virtual Environment
 DEVICE_ROLE_PBS = 'PBS'		# роль устройств P.Backup Server
 MANUFACTURER = 'ProxScan'	# условный изготовитель
@@ -51,7 +52,7 @@ IFACE_BRIDGE_TYPE = InterfaceTypeChoices.TYPE_BRIDGE
 
 PVE_DEFAULT_PORT = 8006
 PBS_DEFAULT_PORT = 8007
-PROX_DEFAULT_USER = 'root@pam'
+PROX_DEFAULT_USER = 'root@pam'	# обязательный параметр, но не используется
 
 
 class ProxmoxImport(Script):
@@ -103,7 +104,7 @@ class ProxmoxImport(Script):
         try:
             prox_secret = Secret.objects.get(role=secret_role, assigned_object_id=host_dev.id)
         except:
-            self.log_warning(f"Не задан токен устройства '{host_dev.name}'")
+            self.log_warning(f"Не задан токен устройства '{host_dev.name}'", host_dev)
             return None		# нет девайса/нет токена для работы
         try:
             prox_secret.decrypt(masterkey)
@@ -209,7 +210,7 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Manufacturer ID: {p_man.id}")
         return p_man
 
-    def get_device_type(self, commit, name=DEVICE_TYPE, units=2.0, set_manufacturer=None, set_tag=None):
+    def get_device_type(self, commit, name=DEVICE_TYPE, units=DEVICE_HEIGHT, set_manufacturer=None, set_tag=None):
         try:
             d_type = DeviceType.objects.get(model=name)	# проверка наличия типа устройств
         except:
@@ -275,11 +276,11 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Device role ID: {d_role.id}")
         return d_role
 
-    def get_device(self, commit, site, name=None, d_role=None, d_type=None, v_cluster=None, \
+    def get_device(self, commit, name, site, d_role=None, d_type=None, v_cluster=None, \
                         ipaddr=None, status=DeviceStatusChoices.STATUS_ACTIVE, set_tag=None):
 #        self.log_debug(f"Device '{name}': site={site.id} role={str(d_role)} type={str(d_type)} cluster={str(v_cluster)} addr={str(ipaddr)}")
         try:
-            c_node = Device.objects.get(site=site, name=name)	# проверка наличия устройства (безымянные допускаются)
+            c_node = Device.objects.get(name=name)	# проверка наличия устройства
         except:
             if commit and name:		# создавать безымянные не будем
                 self.log_success(f"Нет устройства '{name}', создаем.")
@@ -519,14 +520,14 @@ class ProxmoxImport(Script):
         if len(vm_ip_list)==1:
             ip_prim = IPAddress.objects.get(address=vm_ip_list[0])
             if commit and (vdev.primary_ip4 != ip_prim):
-                self.log_success(f"Обновляем primary адрес VM {vdev.id} '{vdev.name}' -> {ip_prim}")
+                self.log_success(f"Обновляем primary адрес VM '{vdev.name}' -> {ip_prim}", vdev)
                 if vdev.pk and hasattr(vdev, 'snapshot'):
                     vdev.snapshot()		# запись для истории изменений
                 vdev.primary_ip4 = ip_prim
                 vdev.save()
             return vdev.primary_ip4
         elif commit and len(vm_ip_list) > 1 and not vdev.primary_ip4:
-            self.log_warning(f"У ВМ id={vdev.id} '{vdev.name}' несколько IP-адресов, Primary адрес надо выбрать вручную.")
+            self.log_warning(f"У ВМ '{vdev.name}' несколько IP-адресов, Primary адрес надо выбрать вручную.", vdev)
         return None
 
 # разбор строки описания носителя. Пример: 'sas_vm:vm-152-disk-0,size=120G'
@@ -626,7 +627,7 @@ class ProxmoxImport(Script):
         if not (net_info and mac):
             return None
         for vm_interface in net_info['result']:
-            if vm_interface['hardware-address'] != mac.lower():	# ищем заданный MAC-address
+            if vm_interface['hardware-address'].lower() != mac.lower():	# ищем заданный MAC-address
                 continue
             if attr=='name':
                 return vm_interface['name']
@@ -706,7 +707,7 @@ class ProxmoxImport(Script):
         if (not commit):
             return not upd
         if upd:
-            self.log_success(f"Связка MAC-адреса {iface_mac} -> interface {iface.id} '{iface.name}'")
+            self.log_success(f"Связка MAC-адреса {iface_mac} -> interface {iface.id} '{iface.name}'", iface)
             if mac_address.pk and hasattr(mac_address, 'snapshot'):
                 mac_address.snapshot()		# запись для истории изменений
             mac_address.assigned_object_type_id = interface_ct
@@ -779,6 +780,8 @@ class ProxmoxImport(Script):
                 node_name = dev_name
 # ищем устройство (создаем, если их несколько в кластере)
             node_dev = self.get_device(commit, name=node_name, site=site,
+                                        d_role=self.get_device_role(commit, name=DEVICE_ROLE_PVE, set_tag=set_tag),
+                                        d_type=self.get_device_type(commit, set_tag=set_tag),
                                         v_cluster=cluster, status=node_status, set_tag=set_tag)
             if node['status'] != 'online':		# не работает нода в кластере ?
                 continue
@@ -936,7 +939,7 @@ class ProxmoxImport(Script):
 # ищем в базе устройство
                 s_dev = self.get_device(False, name=s_name, site=def_site)
                 if s_dev:		# в списке есть, но Proxmox не отвечает
-#                    self.log_debug(f"Device '{s_dev.name}' is offline.")
+#                    self.log_debug(f"Device '{s_dev.name}' is offline.", s_dev)
                     self.update_device(commit, s_dev, status=DeviceStatusChoices.STATUS_OFFLINE)
                 continue		# прочие сервисы на этом адресе игнорируем
 # создаем устройство
@@ -956,8 +959,8 @@ class ProxmoxImport(Script):
             self.log_info(f"Анализ {prox._backend.auth.service} {prox_version} по адресу: {str(addr)}")
             if prox._backend.auth.service==DEVICE_ROLE_PVE:
                 p_stat = self.check_pve(commit, prox, addr, site=def_site, set_tag=script_tag)
-                self.log_success(f"Анализ PVE '{p_stat['name']}' по адресу: {str(addr)} завершен. Nodes: {p_stat['nodes']}, VMs: {p_stat['vms']}")
+                self.log_success(f"Анализ PVE '{p_stat['name']}' по адресу: {str(addr)} завершен. Nodes: {p_stat['nodes']}, VMs: {p_stat['vms']}", s_dev)
             else:
                 p_stat = self.check_pbs(commit, prox, s_dev, addr, set_tag=script_tag)
-                self.log_success(f"Анализ PBS '{p_stat['name']}' по адресу: {str(addr)} завершен.")
+                self.log_success(f"Анализ PBS '{p_stat['name']}' по адресу: {str(addr)} завершен.", s_dev)
         return
