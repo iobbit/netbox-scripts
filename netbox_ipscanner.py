@@ -35,11 +35,10 @@ class IpScan(Script):
         if data['TagBasedScanning'] and not data['select_tag']:
             return "Selected 'Tag Based Scanning', but tag is not chosen."
         nm = nmap.PortScanner()
-        subnets = Prefix.objects.all()  # extracts all prefixes, in format x.x.x.x/yy
 
-        for subnet in subnets:
+        for subnet in Prefix.objects.all():		# extracts all prefixes, in format x.x.x.x/yy:
             s_tags = sorted([tag.name for tag in subnet.tags.all()])
-            self.log_info(f'Checking {str(subnet)} ... Mask length is {subnet.mask_length}; Status is {subnet.status}; Tags is {s_tags}')
+            self.log_info(f'Checking {str(subnet)}: Status is {subnet.status}; Tags is {s_tags}')
 
             if data['TagBasedScanning'] and str(data['select_tag']) not in s_tags:	# Only scan subnets with the Tag
 #                self.log_debug(f"Scan of {subnet.prefix} NOT done (missing '{data['select_tag']}' tag)")
@@ -50,12 +49,28 @@ class IpScan(Script):
 # сканируем подсеть
             nm.scan(hosts=str(subnet), arguments=nmap_arguments)
             self.log_debug(f'{nm.scanstats()}')
-# пауза между сканированиями
-            time.sleep(5)
 # обрабатываем найденные активные адреса
             for host in nm.all_hosts():
 #                self.log_debug(f'Find {host} : {nm[host].hostname()}')
                 self.update_ip(commit, f'{host}/{subnet.mask_length}', nm[host].hostname())
+# обновляем существующие адреса
+            for host in subnet.get_child_ips():
+                DNS_record = self.host_lookup(host.address)
+#                self.log_debug(f'Process {host} : {DNS_record}')
+                self.update_ip(commit, str(host.address), DNS_record)
+# пауза между сканированиями подсетей
+            time.sleep(5)
+
+# поиск имени для адреса
+    def host_lookup(self, addr):
+        a_str = str(addr).split('/')[0]
+        try:
+            res =  socket.gethostbyaddr(a_str)
+            a_name = res[0]
+        except:
+            a_name = ''
+#        self.log_debug(f'Lookup {a_str}: {a_name}')
+        return a_name
 
 # ввод/обновление данных по адресу
     def update_ip(self, commit, ipn, name):
