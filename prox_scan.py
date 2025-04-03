@@ -329,11 +329,14 @@ class ProxmoxImport(Script):
         if description and description != dev.description:
             u_str.append(f"{description}")
             dev.description = description
-        dev.full_clean()
         if ip4 and ip4 != dev.primary_ip4:
             u_str.append(f"ip4={str(ip4)}")
-            dev.primary_ip4 = ip4	# после проверки
-        self.log_success(f"Обновляем устройство {dev.name}: {', '.join(u_str)}", dev)
+            dev.primary_ip4 = ip4
+        self.log_success(f"Обновляем устройство '{dev.name}': {', '.join(u_str)}", dev)
+        try:
+            dev.full_clean()
+        except:
+            self.log_warning(f"Какое-то несоответствие при обновлении устройства '{dev.name}' !", dev)
         dev.save()
         return True
 
@@ -348,7 +351,6 @@ class ProxmoxImport(Script):
                     name = name,
                     type = iface_type,
                     mtu = mtu,
-#                    mac_address = mac,         # Proxmox не показывает MAC для интерфейсов хоста - не используем
                     enabled = iface_enabled,
                     bridge = bridge_iface,
                     description = f"{DESC_STR}'{self.Meta.name}'",
@@ -366,7 +368,8 @@ class ProxmoxImport(Script):
 
     def update_dev_iface(self, commit, iface, iface_mtu, iface_enabled, iface_bridge):
         upd = False
-        upd = upd or (str(iface_mtu) != str(iface.mtu))
+# обновляем MTU только если есть значение, вручную установленное - не очищаем
+        upd = upd or iface_mtu and (str(iface_mtu) != str(iface.mtu))
         upd = upd or (bool(iface_enabled) != iface.enabled)
         upd = upd or (iface_bridge != iface.bridge)
         if (not commit) or (not upd):
@@ -374,7 +377,7 @@ class ProxmoxImport(Script):
         u_str =[]
         if iface.pk and hasattr(iface, 'snapshot'):
             iface.snapshot()		# запись для истории изменений
-        if (str(iface_mtu) != str(iface.mtu)):
+        if iface_mtu and (str(iface_mtu) != str(iface.mtu)):
             u_str.append(f"MTU={iface_mtu}")
             iface.mtu = iface_mtu
         if bool(iface_enabled) != iface.enabled:
@@ -739,7 +742,7 @@ class ProxmoxImport(Script):
             else:
                 i_type = IFACE_VIRTUAL_TYPE
                 self.log_warning(f"Неизвестный тип интерфейса {iface['iface']}: {iface['type']}")
-# делаем/обновляем интерфейс
+# делаем/обновляем интерфейс (Proxmox не показывает MAC для интерфейсов хоста - не используем)
             dev_iface = self.get_iface(commit, node_dev, iface['iface'], iface_type=i_type,
                                     mtu=i_mtu, iface_enabled=i_status, bridge_iface=i_bridge, set_tag=set_tag)
             if 'cidr' in iface and dev_iface:
