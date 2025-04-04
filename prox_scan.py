@@ -118,16 +118,21 @@ class ProxmoxImport(Script):
                          token_name=prox_secret.name, token_value=prox_secret.plaintext, verify_ssl=False)
         # проверка доступности API
         if api:
+#            self.log_debug(f"API: {api}", host_dev)
             try:
-#                realms = api.access.domains.get()		# работает без аутентификации
-#                self.log_debug(f"Proxmox realms: {realms}")
-                vers = api.version.get()
-#                self.log_debug(f"Версия Proxmox: {vers}", host_dev)
+                realms = api.access.domains.get()		# работает без аутентификации
+#                self.log_debug(f"Proxmox realms: {realms}", host_dev)
+                try:
+                    vers = api.version.get()
+#                    self.log_debug(f"Версия Proxmox: {vers}", host_dev)
+                except:
+                    self.log_failure(f"Анализ '{host_dev.name}' невозможен: невалидный токен {prox_secret.name} !", host_dev)
+                    return None
             except:
-                self.log_failure(f"Анализ '{host_dev.name}' невозможен: невалидный токен {prox_secret.name} !", host_dev)
+                self.log_failure(f"{prox_service} API @ {ip4}:{dev_port} не отвечает!", host_dev)
                 return None
         else:
-            self.log_failure(f"Соединение с {prox_service} at: {ip4}:{dev_port} не установлено!")
+            self.log_failure(f"Соединение с {prox_service} @ {ip4}:{dev_port} не установлено!", host_dev)
         return api
 
 # поиск/создание объекта Tag нужного вида
