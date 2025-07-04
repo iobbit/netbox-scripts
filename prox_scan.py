@@ -23,7 +23,7 @@ from ipam.models import Prefix, IPAddress
 # должен быть установлен плагин 'netbox_secrets'
 try:
     from netbox_secrets.models import SecretRole,Secret,UserKey
-    PROX_SECRET_ROLE = 'proxmox_token'	# роль секретов для доступа к Proxmox
+    PROX_SECRET_ROLE = 'proxmox_token'	# SecretRole для доступа к Proxmox
 except ImportError:
     PROX_SECRET_ROLE = ''		# без доступа к Proxmox API
 
@@ -341,7 +341,7 @@ class ProxmoxImport(Script):
         try:
             dev.full_clean()
         except:
-            self.log_warning(f"Какое-то несоответствие при обновлении устройства '{dev.name}' !", dev)
+            self.log_warning(f"Несоответствие при обновлении устройства '{dev.name}'! (нет адреса интерфейса?)", dev)
         dev.save()
         return True
 
@@ -428,13 +428,18 @@ class ProxmoxImport(Script):
         upd = (ip_address.assigned_object_type_id != interface_ct) or (ip_address.assigned_object_id != iface.id)
         if (not commit) or (not upd):
             return False
-        self.log_success(f"Связка адреса {ip4} -> interface {iface.id} '{iface.name}' dev.real={real}", iface)
         if ip_address.pk and hasattr(ip_address, 'snapshot'):
             ip_address.snapshot()		# запись для истории изменений
         ip_address.assigned_object_type_id = interface_ct
         ip_address.assigned_object_id = iface.id
-        ip_address.full_clean()
-        ip_address.save()
+        try:
+            ip_address.full_clean()
+        except:
+            self.log_warning(f"Ошибка связки адреса {ip4} -> interface '{iface.name}' dev.real={real}", iface)
+            return False
+        else:
+            self.log_success(f"Связка адреса {ip4} -> interface '{iface.name}' dev.real={real}", iface)
+            ip_address.save()
         return True
 
 # поиск/создание/обновление виртуальной машины
