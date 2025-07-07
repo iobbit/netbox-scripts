@@ -809,11 +809,11 @@ class ProxmoxImport(Script):
                 vm_stat = VirtualMachineStatusChoices.STATUS_ACTIVE if vm['status'] == 'running' else VirtualMachineStatusChoices.STATUS_OFFLINE
                 vm_conf = prox.nodes(node['node']).lxc(vm['vmid']).config.get()
 #                self.log_debug(f"Conf {vm['name']}: {vm_conf}")
-                descr = f"VM тип=LXC, OStype={vm_conf['ostype']}"
+                descr = f"VM тип=LXC, OStype={vm_conf['ostype'] if 'ostype' in vm_conf else 'other'}"
 # делаем/обновляем ВМ
                 nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'],
-                                cpus=vm['cpus'], mem=int(vm_conf['memory']), disk=self.calc_disks(vm_conf),
-                                set_tag=set_tag, description=descr)
+                                cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
+                                disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
 # создаем/обновляем интерфейсы ВМ
@@ -841,11 +841,11 @@ class ProxmoxImport(Script):
                     vm_stat = VirtualMachineStatusChoices.STATUS_OFFLINE
                     vm_netinfo = None
 #                self.log_debug(f"Info {vm['name']}: {vm_netinfo}")
-                descr = f"VM тип=QEMU, OStype={vm_conf['ostype']}"
+                descr = f"VM тип=QEMU, OStype={vm_conf['ostype'] if 'ostype' in vm_conf else 'other'}"  # иногда нет параметра (глюк Proxmox?)
 # делаем/обновляем ВМ
                 nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'],
-                                cpus=vm['cpus'], mem=int(vm_conf['memory']), disk=self.calc_disks(vm_conf),
-                                set_tag=set_tag, description=descr)
+                                cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
+                                disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
 # создаем/обновляем интерфейсы ВМ
