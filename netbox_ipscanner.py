@@ -4,9 +4,12 @@ from ipam.models import Prefix, IPAddress
 from extras.models import Tag
 from extras.scripts import Script, BooleanVar, StringVar, ObjectVar
 
-nmap_arguments = '-sP -PE -PP -PU135,137,161 -PS22,80,135,139,443,515,3389,9100 -PA80,113,443 -T4 --send-ip --release-memory'
+nmap_arguments = '-sn -PR -PE -PP -PS22,80,135,139,443,515,3389,9100 -PA22,80,113,443,3128,3389,8080 -T4'
+#nmap_arguments = '-sn -PE -PP -PS22,80,135,139,443,515,3389,9100 -PA22,80,113,443,3389 -T3 --send-ip'
 #nmap_arguments = '-sn -PE -PP -PS21,22,23,25,80,113,443,31339 -PA80,113,443,10042 -T4 --source-port 53'        # рекомендовано nmap-docs
 #nmap_arguments = '-sn --send-ip -PR -PP -T2 --source-port 53'                  # длинные таймауты - находит почти всё (долго)
+
+DESC_STR = 'Автоматически добавлено скриптом '
 
 class IpScan(Script):
     # optional variables in UI here!
@@ -28,7 +31,7 @@ class IpScan(Script):
         name = "IP Scanner"
         description = "Сканирует префиксы (с выбранной меткой или активные) и обновляет IPv4 адреса"
         commit_default = True
-        job_timeout = 600
+        job_timeout = 900
 
     def run(self, data, commit):
 #        self.log_debug(f"Chosen '{data['select_tag']}' tag")
@@ -51,11 +54,12 @@ class IpScan(Script):
             self.log_debug(f'{nm.scanstats()}')
 # обрабатываем найденные активные адреса
             for host in nm.all_hosts():
-#                self.log_debug(f'Find {host} : {nm[host].hostname()}')
+#                self.log_debug(f'Find {host} : {nm[host]}')
                 self.update_ip(commit, f'{host}/{subnet.mask_length}', nm[host].hostname())
-# обновляем существующие адреса
+# дополнительно обновляем ВСЕ существующие адреса этой подсети в базе данных
             for host in subnet.get_child_ips():
-                DNS_record = self.host_lookup(host.address)
+                a_str = str(host.address).split('/')[0]
+                DNS_record = self.host_lookup(a_str)
 #                self.log_debug(f'Process {host} : {DNS_record}')
                 self.update_ip(commit, str(host.address), DNS_record)
 # пауза между сканированиями подсетей
@@ -63,13 +67,12 @@ class IpScan(Script):
 
 # поиск имени для адреса
     def host_lookup(self, addr):
-        a_str = str(addr).split('/')[0]
         try:
-            res =  socket.gethostbyaddr(a_str)
+            res = socket.gethostbyaddr(addr)
             a_name = res[0]
         except:
             a_name = ''
-#        self.log_debug(f'Lookup {a_str}: {a_name}')
+#        self.log_debug(f'Lookup {addr}: {a_name}')
         return a_name
 
 # ввод/обновление данных по адресу
@@ -92,7 +95,7 @@ class IpScan(Script):
                 new_address = IPAddress(
                     address = ipn,
                     dns_name = name,
-                    description = f'Автоматически добавлено скриптом {self.Meta.name}',
+                    description = f"{DESC_STR}'{self.Meta.name}'",
                     )
                 new_address.full_clean()
                 new_address.save()
