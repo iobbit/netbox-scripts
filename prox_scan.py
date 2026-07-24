@@ -5,20 +5,22 @@
 
 import re
 import requests		# для proxmoxer и определения 'username' в http-запросе
-import socket		# для проверки соединения по IP
-from proxmoxer import ProxmoxAPI
+import subprocess	# для получения таблицы ARP внешней командой
+from proxmoxer import ProxmoxAPI, AuthenticationError
 
 from django.contrib.contenttypes.models import ContentType
+from django.utils.text import slugify
 
 from netbox.choices import ColorChoices
 from extras.scripts import Script, ObjectVar, FileVar
 from users.models import User
 from extras.models import Tag
 from virtualization.models import ClusterType, Cluster, VirtualMachine, VMInterface
-from virtualization.choices import VirtualMachineStatusChoices
+from virtualization.choices import VirtualMachineStatusChoices, VirtualMachineStartOnBootChoices
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices
-from dcim.models import Interface,MACAddress,Device,DeviceRole,DeviceType,Manufacturer,Site
+from dcim.models import Interface,MACAddress,Device,DeviceRole,DeviceType,Platform,Manufacturer,Site
 from ipam.models import Prefix, IPAddress
+from utilities.counters import update_counts
 
 # должен быть установлен плагин 'netbox_secrets'
 try:
@@ -31,17 +33,20 @@ except ImportError:
 PROX_TAG_COLOR = ColorChoices.COLOR_INDIGO
 PROX_COLOR_PVE = ColorChoices.COLOR_DARK_PURPLE
 PROX_COLOR_PBS = ColorChoices.COLOR_PURPLE
+PROX_COLOR_SERVER = ColorChoices.COLOR_TEAL
 
 # значения для автоматически добавляемых скриптом объектов
 DESC_STR = 'Создано скриптом '
-TAG_AUTO = 'prox_scan'		# метка
+TAG_AUTO = 'prox_scan'		# метка для автоматически создаваемых объектов
 CLUSTER_TYPE = 'Proxmox'	# тип кластеров
 DEVICE_TYPE = 'ProxScan'	# тип устройств
-DEVICE_HEIGHT = 2.0		# высота устройств по умолчанию
-DEVICE_ROLE_PVE = 'PVE'		# роль устройств P.Virtual Environment
-DEVICE_ROLE_PBS = 'PBS'		# роль устройств P.Backup Server
-MANUFACTURER = 'ProxScan'	# условный изготовитель
-VM_DEFAULT_ROLE = 'server'	# роль по умолчанию для вирт.машин
+DEVICE_HEIGHT = 2.0		# размер (высота) стоечных устройств по умолчанию
+DEVICE_ROLE_PVE = 'PVE'		# роль устройств Proxmox Virtual Environment
+PLATFORM_PVE = 'Proxmox VE'	# базовая платформа PVE
+DEVICE_ROLE_PBS = 'PBS'		# роль устройств Proxmox Backup Server
+PLATFORM_PBS = 'Proxmox BS'	# базовая платформа PBS
+VM_DEFAULT_ROLE = 'vm'		# роль по умолчанию для вирт.машин
+DEF_MANUFACTURER = 'ProxScan'	# условный изготовитель
 
 # тип для физических интерфейсов
 IFACE_DEFAULT_TYPE = InterfaceTypeChoices.TYPE_1GE_TX_FIXED
@@ -51,9 +56,14 @@ IFACE_VIRTUAL_TYPE = InterfaceTypeChoices.TYPE_VIRTUAL
 IFACE_BRIDGE_TYPE = InterfaceTypeChoices.TYPE_BRIDGE
 #IFACE_LAG_TYPE = InterfaceTypeChoices.TYPE_LAG
 
-PVE_DEFAULT_PORT = 8006
-PBS_DEFAULT_PORT = 8007
-PROX_DEFAULT_USER = 'root@pam'	# обязательный параметр, но не используется
+# максимальное количество проверяемых интерфейсов вирт.машин
+MAX_VM_IFACE = 8
+# префикс для адресов из ARP-таблицы
+IP4_DEFAUT_PREFIX = '/24'
+
+PROX_TIMEOUT = 1		# default=5
+PROX_TEST_TOKEN = 'test_token'	# в Proxmox API для проверки соединений, произвольно
+PROX_TOKEN_USER = 'root@pam'	# пользователь Proxmox API, без него не работает авторизация по токену
 
 
 class ProxmoxImport(Script):
@@ -62,7 +72,7 @@ class ProxmoxImport(Script):
         name = "Proxmox import"
         description = "Просматривает IP адреса, ищет Proxmox и обновляет списки 'Devices', 'Interfaces', 'Clusters' и 'Virtual Machines'"
         commit_default = True
-        job_timeout = 90
+        job_timeout = 600
 
     select_site = ObjectVar(
         model=Site,
@@ -78,29 +88,35 @@ class ProxmoxImport(Script):
         description="Загрузите файл приватного ключа для доступа к API Proxmox",
     )
 
+    ARP_Table = {}		# ARP-таблица для поиска MAC по IP (заполняется один раз)
 
-# проверка доступности порта
-    def is_port_open(self, host, port):
-        s = socket.socket()
-        s.settimeout(0.2)			# таймаут для чуть большей скорости
-        result = s.connect_ex((host, port))	# попытка присоединения через порт
-        s.close()
-        return result == 0
 
 # установка соединения с хостом Proxmox с использованием токена
-    def connect(self, server_addr, host_dev, masterkey, secret_role):
+    def connect(self, server_addr, host_dev=None, masterkey=None, secret_role=None):
+        ip_str = str(server_addr).split('/')[0]
+        if not host_dev:		# просто проверяем наличие API Proxmox по адресу
+            prox_service = None
+            for srv in (DEVICE_ROLE_PVE, DEVICE_ROLE_PBS):
+                api = ProxmoxAPI(ip_str, service=srv, token_name=PROX_TEST_TOKEN, token_value=PROX_TEST_TOKEN,
+                                verify_ssl=False, timeout=PROX_TIMEOUT)
+#                self.log_debug(f'По адресу {ip_str} API создан! {api}')
+                try:
+                    realms = api.access.domains.get()		# работает без аутентификации
+#                    self.log_debug(f'Успешно: {realms}')
+                    prox_service = srv
+                    break
+                except AuthenticationError as e:		# требует аутентификации
+#                    self.log_debug(f'Ошибка аутентификации: {e}')
+                    prox_service = srv
+                    break
+                except Exception as e:
+#                    self.log_debug(f'Ошибка при работе с API: {e}')
+                    pass
+#            self.log_debug(f'По адресу {ip_str} обнаружено: {prox_service}')
+            return prox_service
+#
         if not masterkey:		# нет доступа к API
             return None
-        ip4 = str(server_addr).split('/')[0]
-        if self.is_port_open(ip4, PVE_DEFAULT_PORT):
-            dev_port = PVE_DEFAULT_PORT
-            prox_service = DEVICE_ROLE_PVE
-        elif self.is_port_open(ip4, PBS_DEFAULT_PORT):
-            dev_port = PBS_DEFAULT_PORT
-            prox_service = DEVICE_ROLE_PBS
-        else:
-            return None		# прочие сервисы игнорируем
-#        self.log_debug(f"Обнаружен {prox_service} по адресу: {ip4}", host_dev)
 # секрет с нужной ролью у девайса должен быть только один
         try:
             prox_secret = Secret.objects.get(role=secret_role, assigned_object_id=host_dev.id)
@@ -110,29 +126,29 @@ class ProxmoxImport(Script):
         try:
             prox_secret.decrypt(masterkey)
         except:
-            self.log_failure(f"Загружен не соответствующий файл ключа!")
+            self.log_failure(f'Загружен не соответствующий файл ключа!')
             return None
-# соединение с API
-#        self.log_debug(f"Check {prox_service} API at: {host_dev.name}={ip4}:{dev_port} with token {prox_secret.name}={prox_secret.plaintext}", host_dev)
-        api = ProxmoxAPI(ip4, port=dev_port, user=PROX_DEFAULT_USER, service=prox_service,
+# создание API
+#        self.log_debug(f"Check {host_dev.role} API on '{host_dev.name}' @ {ip_str} with token {prox_secret.name}={prox_secret.plaintext}", host_dev)
+        api = ProxmoxAPI(ip_str, service=str(host_dev.role), user=PROX_TOKEN_USER,
                          token_name=prox_secret.name, token_value=prox_secret.plaintext, verify_ssl=False)
-        # проверка доступности API
+# проверка доступности API
+#        self.log_debug(f'API: {api}', host_dev)
         if api:
-#            self.log_debug(f"API: {api}", host_dev)
             try:
-                realms = api.access.domains.get()		# работает без аутентификации
-#                self.log_debug(f"Proxmox realms: {realms}", host_dev)
+                realms = api.access.domains.get()	# работает без аутентификации
+#                self.log_debug(f'Proxmox realms: {realms}', host_dev)
                 try:
-                    vers = api.version.get()
-#                    self.log_debug(f"Версия Proxmox: {vers}", host_dev)
+                    vers = api.version.get()		# требует аутентификации
+#                    self.log_debug(f'Версия Proxmox: {vers}', host_dev)
                 except:
                     self.log_failure(f"Анализ '{host_dev.name}' невозможен: невалидный токен {prox_secret.name} !", host_dev)
                     return None
             except:
-                self.log_failure(f"{prox_service} API @ {ip4}:{dev_port} не отвечает!", host_dev)
+                self.log_failure(f'{host_dev.role} API @ {ip_str} не отвечает!', host_dev)
                 return None
         else:
-            self.log_failure(f"Соединение с {prox_service} @ {ip4}:{dev_port} не установлено!", host_dev)
+            self.log_failure(f'Соединение с {host_dev.role} @ {ip_str} не установлено!', host_dev)
         return api
 
 # поиск/создание объекта Tag нужного вида
@@ -196,7 +212,7 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Cluster ID: {c_clust.id}, '{c_clust.name}'", c_clust)
         return c_clust
 
-    def get_manufacturer(self, commit, name=MANUFACTURER, set_tag=None):
+    def get_manufacturer(self, commit, name=DEF_MANUFACTURER, set_tag=None):
         try:
             p_man = Manufacturer.objects.get(name=name)	# проверка наличия производителя
         except:
@@ -261,7 +277,7 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Secret role ID: {s_role.id}, '{s_role.name}'", s_role)
         return s_role
 
-    def get_device_role(self, commit, name=DEVICE_ROLE_PVE, set_tag=None):
+    def get_device_role(self, commit, name, set_tag=None):
         try:
             d_role = DeviceRole.objects.get(name=name)	# проверка наличия роли устройств
         except:
@@ -269,7 +285,7 @@ class ProxmoxImport(Script):
                 self.log_success(f"Нет роли устройств '{name}', создаем.")
                 d_role = DeviceRole(
                     name = name,
-                    color = PROX_COLOR_PVE if name==DEVICE_ROLE_PVE else PROX_COLOR_PBS,
+                    color = PROX_COLOR_PVE if name==DEVICE_ROLE_PVE else PROX_COLOR_PBS if name==DEVICE_ROLE_PBS else PROX_COLOR_SERVER,
                     slug = name.lower(),
                     description = f"{DESC_STR}'{self.Meta.name}'",
                     )
@@ -282,6 +298,33 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Device role ID: {d_role.id}, '{d_role.name}'", d_role)
         return d_role
 
+# поиск/создание платформы устройств. Для PVE и PBS - со ссылкой на родительскую (без версии)
+# name = parent_name+version
+    def get_platform(self, commit, name):
+#        self.log_debug(f"Find platform '{name}'")
+        if not name:
+            return None
+        try:
+            n_platform = Platform.objects.get(name=name)	# проверка наличия платформы
+        except:
+            if commit:
+                self.log_success(f"Нет платформы '{name}', создаем.")
+                if name==PLATFORM_PVE or name==PLATFORM_PBS:
+                    ppl = None
+                elif name.startswith(PLATFORM_PVE):
+                    ppl = Platform.objects.get(name=PLATFORM_PVE)
+                elif name.startswith(PLATFORM_PBS):
+                    ppl = Platform.objects.get(name=PLATFORM_PBS)
+                else:
+                    ppl = None
+                n_platform = Platform(name=name, slug=slugify(name), parent=ppl)
+                n_platform.full_clean()
+                n_platform.save()
+            else:
+                return None
+#        self.log_debug(f"Platform ID: {n_platform.id}, '{n_platform.name}'", n_platform)
+        return n_platform
+
     def get_device(self, commit, name, site, d_role=None, d_type=None, v_cluster=None, \
                         ipaddr=None, status=DeviceStatusChoices.STATUS_ACTIVE, set_tag=None):
 #        self.log_debug(f"Find device '{name}': site={site.id} role={str(d_role)} type={str(d_type)} cluster={str(v_cluster)} addr={str(ipaddr)}")
@@ -289,6 +332,15 @@ class ProxmoxImport(Script):
             c_node = Device.objects.get(name=name)	# проверка наличия устройства
         except:
             if commit and name:		# создавать безымянные не будем
+                if ipaddr:
+                    ip_nodes = Device.objects.filter(primary_ip4=ipaddr)	# проверка по адресу
+                    if len(ip_nodes):
+                        self.log_failure(f"Устройство '{name}' не может быть создано! "
+                                        f"Уже есть устройства с адресом ({ipaddr}): {', '.join([n.name for n in ip_nodes])}")
+                        return None
+                    else:
+                        self.log_debug(f"Устройство с именем {name} и адресом {ipaddr} не найдено!")
+                        pass
                 self.log_success(f"Нет устройства '{name}', создаем.")
                 c_node = Device(
                     name = name,
@@ -300,8 +352,8 @@ class ProxmoxImport(Script):
                     comments = f"{DESC_STR}'{self.Meta.name}'",
                     )
                 c_node.full_clean()
-                if ipaddr:
-                    c_node.primary_ip4 = ipaddr
+                if ipaddr:				# после проверки (т.к.еще нет интерфейсов)
+                    c_node.primary_ip4 = ipaddr		# задаем первичный для всего устройства
                 c_node.save()
                 if set_tag:
                     c_node.tags.add(set_tag)		# теги после создания объекта
@@ -310,12 +362,13 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"Device ID: {c_node.id}, '{c_node.name}'", c_node)
         return c_node
 
-    def update_device(self, commit, dev, d_role=None, v_cluster=None, status=None, ip4=None, description=None):
+    def update_device(self, commit, dev, d_role=None, v_cluster=None, status=None, ip4=None, platform=None, description=None):
         upd = False
         upd = upd or (d_role and d_role != dev.role)
         upd = upd or (v_cluster and v_cluster != dev.cluster)
         upd = upd or (status and status != dev.status)
         upd = upd or (ip4 and ip4 != dev.primary_ip4)
+        upd = upd or (platform and (not dev.platform or platform != dev.platform.name))
         upd = upd or (description and description != dev.description)
         if (not commit) or (not upd):
             return False
@@ -331,17 +384,20 @@ class ProxmoxImport(Script):
         if status and status != dev.status:
             u_str.append(f"status={status}")
             dev.status = status
+        if platform and (not dev.platform or platform != dev.platform.name):
+            u_str.append(f"platform={platform}")
+            dev.platform = self.get_platform(commit, platform)
         if description and description != dev.description:
             u_str.append(f"{description}")
             dev.description = description
         if ip4 and ip4 != dev.primary_ip4:
-            u_str.append(f"ip4={str(ip4)}")
-            dev.primary_ip4 = ip4
+            u_str.append(f"IP={str(ip4)}")
+            dev.primary_ip4 = self.get_ip4(False, str(ip4))	# адрес может быть обновлен - берем с новыми данными
         self.log_success(f"Обновляем устройство '{dev.name}': {', '.join(u_str)}", dev)
         try:
             dev.full_clean()
-        except:
-            self.log_warning(f"Несоответствие при обновлении устройства '{dev.name}'! (нет адреса интерфейса?)", dev)
+        except Exception as e:
+            self.log_warning(f"Несоответствие при обновлении устройства '{dev.name}'! {e}", dev)
         dev.save()
         return True
 
@@ -373,7 +429,7 @@ class ProxmoxImport(Script):
 
     def update_dev_iface(self, commit, iface, iface_mtu, iface_enabled, iface_bridge):
         upd = False
-# обновляем MTU только если есть значение, вручную установленное - не очищаем
+# обновляем MTU только если есть новое значение, уже установленное - не очищаем
         upd = upd or iface_mtu and (str(iface_mtu) != str(iface.mtu))
         upd = upd or (bool(iface_enabled) != iface.enabled)
         upd = upd or (iface_bridge != iface.bridge)
@@ -415,11 +471,12 @@ class ProxmoxImport(Script):
                 return ip_address
         return None
 
-    def update_ip4(self, commit, iface, ip4):
+    def update_ip4(self, commit, iface, ip4: str):
         ip_address = self.get_ip4(commit, ip4)
         if not ip_address:
             self.log_warning(f"Адрес привязки {ip4} для интерфейса '{iface.name}' не найден!", iface)
             return False
+#        self.log_debug(f"Update IP-address: {str(ip_address.id)}, object={ip_address.assigned_object}", ip_address)
         real = hasattr(iface, 'mark_connected')	# 'true' только для физических интерфейсов
         if real:
             interface_ct = ContentType.objects.get_for_model(Interface).pk
@@ -430,12 +487,13 @@ class ProxmoxImport(Script):
             return False
         if ip_address.pk and hasattr(ip_address, 'snapshot'):
             ip_address.snapshot()		# запись для истории изменений
-        ip_address.assigned_object_type_id = interface_ct
-        ip_address.assigned_object_id = iface.id
+#        ip_address.assigned_object_type_id = interface_ct
+#        ip_address.assigned_object_id = iface.id
+        ip_address.assigned_object = iface
         try:
             ip_address.full_clean()
-        except:
-            self.log_warning(f"Ошибка связки адреса {ip4} -> interface '{iface.name}' dev.real={real}", iface)
+        except Exception as e:
+            self.log_warning(f"Ошибка связки адреса {ip4} -> interface '{iface.name}' dev.real={real}! {e}", iface)
             return False
         else:
             self.log_success(f"Связка адреса {ip4} -> interface '{iface.name}' dev.real={real}", iface)
@@ -443,8 +501,8 @@ class ProxmoxImport(Script):
         return True
 
 # поиск/создание/обновление виртуальной машины
-    def get_vm(self, commit, name, status, v_cluster, v_role=None, serial=None, cpus=0, mem=0, disk=0,
-                    set_tag=None, description=None):
+    def get_vm(self, commit, name, status, v_cluster, v_role=None, serial=None, onboot=False, platform=None,
+                    cpus=0, mem=0, disk=0, set_tag=None, description=None):
         try:
             vm = VirtualMachine.objects.get(cluster=v_cluster, name=name)	# проверка наличия ВМ в кластере
         except:
@@ -456,6 +514,8 @@ class ProxmoxImport(Script):
                     cluster = v_cluster,	# кластер виртуализации
                     role = v_role if v_role else self.get_device_role(commit, name=VM_DEFAULT_ROLE, set_tag=set_tag),
                     serial = serial,
+                    start_on_boot = VirtualMachineStartOnBootChoices.STATUS_ON if onboot else VirtualMachineStartOnBootChoices.STATUS_OFF,
+                    platform = self.get_platform(commit, platform),
                     vcpus = cpus,
                     memory = mem,		# (MB)
                     disk = disk,		# (MB)
@@ -469,17 +529,20 @@ class ProxmoxImport(Script):
             else:
                 return None
         else:
-            self.update_vm(commit, vm, status, v_cluster, serial, cpus, mem, disk, description)
+            self.update_vm(commit, vm, status, v_cluster, serial, onboot, platform, cpus, mem, disk, description)
 #        self.log_debug(f"VM ID: {vm.id}, '{vm.id}'", vm)
         return vm
 
-    def update_vm(self, commit, dev, status, v_cluster, vm_serial, cpus, mem, disk, description):
-#        self.log_debug(f"ВМ {dev.id}: {dev.status}, cluster={dev.cluster}, ser={dev.serial}, cpu={dev.vcpus}, mem={dev.memory}, disk={dev.disk}, {dev.description}")
+    def update_vm(self, commit, dev, status, v_cluster, vm_serial, onboot, platform, cpus, mem, disk, description):
+#        self.log_debug(f"ВМ {dev.id}: {dev.status}, cluster={dev.cluster}, ser={dev.serial}, onboot={dev.start_on_boot}, cpu={dev.vcpus}, mem={dev.memory}, disk={dev.disk}, {dev.description}")
         serial = str(vm_serial)
+        vm_on_boot = VirtualMachineStartOnBootChoices.STATUS_ON if onboot else VirtualMachineStartOnBootChoices.STATUS_OFF
         upd = False
         upd = upd or (status and status != dev.status)
         upd = upd or (v_cluster and v_cluster != dev.cluster)
         upd = upd or (serial and serial != str(dev.serial))
+        upd = upd or (vm_on_boot != dev.start_on_boot)
+        upd = upd or (platform and (not dev.platform or platform != dev.platform.name))
         upd = upd or (cpus and int(cpus) != int(dev.vcpus))		# в Proxmox сокеты в целых числах
         upd = upd or (mem and mem != dev.memory)
         upd = upd or (disk and disk != dev.disk)
@@ -498,6 +561,12 @@ class ProxmoxImport(Script):
         if serial and (serial != str(dev.serial)):
             u_str.append(f"serial={serial}")
             dev.serial = serial
+        if vm_on_boot != dev.start_on_boot:
+            u_str.append(f"on_boot={vm_on_boot}")
+            dev.start_on_boot = vm_on_boot
+        if platform and (not dev.platform or platform != dev.platform.name):
+            u_str.append(f"platform={platform}")
+            dev.platform = self.get_platform(commit, platform)
         if cpus and (int(cpus) != int(dev.vcpus)):
             u_str.append(f"cpu={cpus}")
             dev.vcpus = cpus
@@ -581,27 +650,28 @@ class ProxmoxImport(Script):
 # создаем интерфейс вирт.машины
     def make_vm_iface(self, commit, vm, net_dev:str, net_str:str, net_info=None, set_tag=None):
 #        self.log_debug(f"VMInterface string: {net_str}", vm)
+#        self.log_debug(f"VMInterface info: {net_info}", vm)
         net_config = dict(map(lambda x: tuple(x.split('=')), net_str.split(',')))
 # Proxmox модели сетевух: e1000 | e1000-82540em | e1000-82544gc | e1000-82545em | e1000e | i82551 | i82557b | i82559er | ne2k_isa | ne2k_pci | pcnet | rtl8139 | virtio | vmxnet3
+# для контейнеров есть 'hwaddr'
         iface_mac = None
-        for attribute in ('hwaddr', 'virtio', 'e1000', 'e1000e', 'rtl8139', 'vmxnet3'):
+        for attribute in ('hwaddr', 'virtio', 'e1000', 'e1000e', 'rtl8139', 'vmxnet3'):	# перебираем сокращенный список
             if attribute in net_config:
                 iface_mac = net_config[attribute]
                 break
-        iface_name = net_config['name'] if 'name' in net_config else \
-                    self.parse_agent_netinfo(net_info, iface_mac, 'name') or net_dev
+        iface_name = self.parse_agent_netinfo(net_info, iface_mac, 'name') or (net_config['name'] if 'name' in net_config else net_dev)
         iface_mtu = net_config['mtu'] if 'mtu' in net_config else None
         iface_enabled = (not net_config['link_down']) if 'link_down' in net_config else True
 # в Netbox атрибуты интерфейса parent и bridge должны быть в той же вирт.машине - не используем, пишем в description
         iface_bridge = net_config['bridge'] if 'bridge' in net_config else ''
 # список IPv4 для привязки к интерфейсу
         ip4 = [net_config['ip']] if 'ip' in net_config else self.parse_agent_netinfo(net_info, iface_mac, 'ip')
-#        self.log_debug(f"VMInterface: {iface_name}: {iface_mac}, {iface_mtu}, {iface_enabled}, {iface_bridge}, {ip4}")
+#        self.log_debug(f"VM Interface: {iface_name}: {iface_mac}, {iface_mtu}, {iface_enabled}, {iface_bridge}, {ip4}", vm)
         try:
             n_iface = VMInterface.objects.get(virtual_machine=vm, name=iface_name)	# проверка наличия интерфейса
         except:
             if commit:
-                self.log_success(f"Нет интерфейса ВМ '{iface_name}', создаем.")
+                self.log_success(f"Нет интерфейса ВМ '{iface_name}', создаем.", vm)
                 n_iface = VMInterface(
                     virtual_machine = vm,
                     name = iface_name,
@@ -620,7 +690,14 @@ class ProxmoxImport(Script):
 #        self.log_debug(f"VMInterface ID: {n_iface.id}, '{n_iface.name}'", n_iface)
         if iface_mac:
 #            self.log_debug(f"Link VM iface '{n_iface.name}' -> MAC={iface_mac}", n_iface)
-            self.update_mac(commit, n_iface, iface_mac, set_tag)
+            self.update_mac(commit, n_iface, iface_mac)
+            if not ip4:				# если IP нет от Proxmox - берем из ARP
+# выбираем IP-адреса из ARP-таблицы по заданному MAC-адресу
+                result = list(filter(lambda item: item[1] == iface_mac.lower(), self.ARP_Table.items()))
+# добавляем дефолтный префикс и в список
+                matched_ip = [item[0]+IP4_DEFAUT_PREFIX for item in result]
+#                self.log_debug(f'Для MAC={iface_mac} найдены IP: {matched_ip}', n_iface)
+                ip4 = matched_ip
         if ip4:
 #            self.log_debug(f"Link VM iface '{n_iface.name}' -> IP={ip4}", n_iface)
             for ip in ip4:
@@ -640,6 +717,7 @@ class ProxmoxImport(Script):
             if vm_interface['hardware-address'].lower() != mac.lower():	# ищем заданный MAC-address
                 continue
             if attr=='name':
+#                self.log_debug(f"Agent Interface name: {vm_interface['name']}")
                 return vm_interface['name']
             elif attr=='ip':
                 iface_ip_list = []
@@ -674,7 +752,7 @@ class ProxmoxImport(Script):
         return True
 
 # создание MAC-адреса
-    def make_MAC(self, macaddr, set_tag=None):
+    def make_MAC(self, macaddr):
         self.log_success(f"Нет MAC-адреса '{macaddr}', создаем.")
         mac = MACAddress(
             mac_address = macaddr,
@@ -682,36 +760,41 @@ class ProxmoxImport(Script):
             )
         mac.full_clean()
         mac.save()
-        if set_tag:
-            mac.tags.add(set_tag)		# теги после создания объекта
 #        self.log_debug(f"MAC: {mac.mac_address}, pk: {mac.pk}", mac)
         return mac
 
 # поиск MAC-адреса для определенного интерфейса
-    def get_MAC(self, commit, iface, macaddr, set_tag=None):
+    def get_MAC(self, commit, iface, macaddr):
 #        self.log_debug(f"Поиск MAC-адреса {macaddr} для интерфейса id={iface.id} '{iface.name}'", iface)
         mac_list = MACAddress.objects.filter(mac_address=macaddr)	# выбираем все сразу
         if len(mac_list)==0:
             if commit:
-                return self.make_MAC(macaddr, set_tag)
+                return self.make_MAC(macaddr)		# делаем новый
         else:
+            if len(mac_list)>1:
+                self.log_debug(f"Найдено MAC-адресов {macaddr}: {len(mac_list)}")
             for mac in mac_list:
-                if mac.assigned_object_id == iface.id:	# нашли уже привязанный
+                if mac.assigned_object_id == iface.id:	# нашли уже привязанный к нужному интерфейсу
                     return mac
             for mac in mac_list:
                 if not mac.assigned_object:		# нашли свободный
                     return mac
             if commit:
-                return self.make_MAC(macaddr, set_tag)	# все заняты - делаем новый
+                self.log_warning(f"Дубликат MAC-адреса {macaddr} для интерфейса id={iface.id} '{iface.name}'", iface)
+                return self.make_MAC(macaddr)		# все заняты - делаем новый
         return None
 
-# привязка MAC-адреса к интерфейсу виртуальной машины
-    def update_mac(self, commit, iface, iface_mac, set_tag):
-        mac_address = self.get_MAC(commit, iface, iface_mac, set_tag)
+# привязка MAC-адреса к интерфейсу
+    def update_mac(self, commit, iface, iface_mac):
+        mac_address = self.get_MAC(commit, iface, iface_mac)
         if not mac_address:
             self.log_warning(f"MAC-адрес {iface_mac} для интерфейса '{iface.name}' не найден!", iface)
             return False
-        interface_ct = ContentType.objects.get_for_model(VMInterface).pk
+        real = hasattr(iface, 'mark_connected')	# 'true' только для физических интерфейсов
+        if real:
+            interface_ct = ContentType.objects.get_for_model(Interface).pk
+        else:
+            interface_ct = ContentType.objects.get_for_model(VMInterface).pk
         upd = (mac_address.assigned_object_type_id != interface_ct) or (mac_address.assigned_object_id != iface.id)
         if (not commit):
             return not upd
@@ -723,7 +806,7 @@ class ProxmoxImport(Script):
             mac_address.assigned_object_id = iface.id
             mac_address.full_clean()
             mac_address.save()
-# делаем MAC первичным в любом случае (у нас только по одному MAC-у на интерфейс)
+# делаем MAC первичным в любом случае (у нас только по одному MAC на интерфейс)
         if iface.primary_mac_address != mac_address:
             self.log_success(f"Обновляем primary MAC-адрес интерфейса '{iface.name}' -> {mac_address}", iface)
             if iface.pk and hasattr(iface, 'snapshot'):
@@ -732,6 +815,7 @@ class ProxmoxImport(Script):
             iface.save()
         return True
 
+# создаем/обновляем интерфейсы хоста
     def make_dev_ifaces(self, commit, prox, node, node_dev, set_tag):
 #        self.log_debug(f"Node {node['node']}: network={prox.nodes(node['node']).network.get()}", node_dev)
         ifaces = sorted(prox.nodes(node['node']).network.get(), key=lambda x: x['type'], reverse=True)	# интерфейсы по типу, сначала ethernet
@@ -746,17 +830,24 @@ class ProxmoxImport(Script):
 #                self.log_debug(f"Ethernet {iface['iface']}: active={i_status}, mtu={i_mtu}")
             elif iface['type'] == 'bridge':
                 i_type = IFACE_BRIDGE_TYPE
-                if 'bridge_ports' in iface:		# ищем порт - должен уже существовать для привязки
+                if 'bridge_ports' in iface:		# ищем порт 'eth' - должен уже существовать для привязки
                     i_bridge = self.get_iface(False, node_dev, iface['bridge_ports'])
 #                self.log_debug(f"Bridge {iface['iface']}: bridge_ports={i_bridge}, active={i_status}, mtu={i_mtu}")
             else:
                 i_type = IFACE_VIRTUAL_TYPE
                 self.log_warning(f"Неизвестный тип интерфейса {iface['iface']}: {iface['type']}")
-# делаем/обновляем интерфейс (Proxmox не показывает MAC для интерфейсов хоста - не используем)
+# делаем/обновляем интерфейс
             dev_iface = self.get_iface(commit, node_dev, iface['iface'], iface_type=i_type,
                                     mtu=i_mtu, iface_enabled=i_status, bridge_iface=i_bridge, set_tag=set_tag)
             if 'cidr' in iface and dev_iface:
                 self.update_ip4(commit, dev_iface, iface['cidr'])
+# Proxmox не показывает MAC для интерфейсов хоста - берем из ARP-таблицы
+                ip_str = iface['cidr'].split('/')[0]
+                i_mac = self.ARP_Table.get(ip_str, '')
+#                self.log_debug(f'Для IP {ip_str} найден MAC={i_mac}', dev_iface)
+                if i_mac and i_mac != '00:00:00:00:00:00':
+#                    self.log_debug(f"Link DEV iface '{dev_iface.name}' -> MAC={i_mac}", dev_iface)
+                    self.update_mac(commit, dev_iface, i_mac)
         return True
 
 # проверка и обновление PVE
@@ -766,7 +857,7 @@ class ProxmoxImport(Script):
         try:
             cluster_name=prox.cluster.status.get()[0]['name']
         except:
-            self.log_warning(f"Ошибка запроса (недостаточные привилегии токена)!")
+            self.log_warning(f"Ошибка запроса API (недостаточные привилегии токена)!")
             return result
         result['name'] = cluster_name
         cluster_type = self.get_cluster_type(commit, set_tag=set_tag)
@@ -800,7 +891,8 @@ class ProxmoxImport(Script):
             self.update_device(commit, node_dev, ip4=host_ip if node_name==dev_name else None,
                             d_role=self.get_device_role(False, name=DEVICE_ROLE_PVE),
                             v_cluster=cluster, status=node_status,
-                            description=f"Proxmox VE {prox.version.get()['version']}, cpu={node['maxcpu']}, mem={int(int(node['maxmem'])/1024**3)} GiB")
+                            platform=f"{PLATFORM_PVE} {prox.version.get()['version']}",
+                            description=f"PVE host, vcpu={node['maxcpu']}, mem={round(int(node['maxmem'])/1054500000/4)*4} GB")
 
 # перебираем вирт.контейнеры
             for vm in prox.nodes(node['node']).lxc.get():
@@ -808,19 +900,25 @@ class ProxmoxImport(Script):
 #                self.log_debug(f"LXC {vm['name']}: {vm}")
                 vm_stat = VirtualMachineStatusChoices.STATUS_ACTIVE if vm['status'] == 'running' else VirtualMachineStatusChoices.STATUS_OFFLINE
                 vm_conf = prox.nodes(node['node']).lxc(vm['vmid']).config.get()
+                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
 #                self.log_debug(f"Conf {vm['name']}: {vm_conf}")
-                descr = f"VM тип=LXC, OStype={vm_conf['ostype'] if 'ostype' in vm_conf else 'other'}"
+# ostype: debian | devuan | ubuntu | centos | fedora | opensuse | archlinux | alpine | gentoo | nixos | unmanaged
+                if ('ostype' in vm_conf) and (vm_conf['ostype'] != 'unmanaged'):
+                    vm_os = vm_conf['ostype'].capitalize()
+                else:
+                    vm_os = None
+                descr = "тип=LXC"
 # делаем/обновляем ВМ
-                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'],
+                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'], onboot=vm_onboot, platform=vm_os,
                                 cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
                                 disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
 # создаем/обновляем интерфейсы ВМ
-                net_device_id = 0
-                while f'net{net_device_id}' in vm_conf:
-                    self.make_vm_iface(commit, nvm, f'net{net_device_id}', vm_conf[f'net{net_device_id}'], set_tag=set_tag)
-                    net_device_id += 1
+                for inum in range(MAX_VM_IFACE):
+                    net_device_id = f'net{inum}'
+                    if net_device_id in vm_conf:
+                        self.make_vm_iface(commit, nvm, net_device_id, vm_conf[net_device_id], set_tag=set_tag)
 # теперь обновляем IP у ВМ
                 self.update_vm_ip(commit, nvm)
 
@@ -840,19 +938,28 @@ class ProxmoxImport(Script):
                 else:
                     vm_stat = VirtualMachineStatusChoices.STATUS_OFFLINE
                     vm_netinfo = None
-#                self.log_debug(f"Info {vm['name']}: {vm_netinfo}")
-                descr = f"VM тип=QEMU, OStype={vm_conf['ostype'] if 'ostype' in vm_conf else 'other'}"  # иногда нет параметра (глюк Proxmox?)
+                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
+#                self.log_debug(f"Agent info {vm['name']}: {vm_netinfo}")
+# ostype: other=unspecified OS | wxp=Microsoft Windows XP | w2k=Microsoft Windows 2000 | w2k3=Microsoft Windows 2003
+#         w2k8=Microsoft Windows 2008 | wvista=Microsoft Windows Vista | win7=Microsoft Windows 7
+#         win8=Microsoft Windows 8/2012/2012r2 | win10=Microsoft Windows 10/2016/2019 | win11=Microsoft Windows 11/2022/2025
+#         l24=Linux 2.4 Kernel | l26=Linux 2.6 - 7.X Kernel | solaris=Solaris/OpenSolaris/OpenIndiania kernel
+                if ('ostype' in vm_conf) and (vm_conf['ostype'] != 'other'):
+                    vm_os = vm_conf['ostype'].capitalize()
+                else:
+                    vm_os = None
+                descr = "тип=QEMU"
 # делаем/обновляем ВМ
-                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'],
+                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'], onboot=vm_onboot, platform=vm_os,
                                 cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
                                 disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
 # создаем/обновляем интерфейсы ВМ
-                net_device_id = 0
-                while f'net{net_device_id}' in vm_conf:
-                    self.make_vm_iface(commit, nvm, f'net{net_device_id}', vm_conf[f'net{net_device_id}'], net_info=vm_netinfo, set_tag=set_tag)
-                    net_device_id += 1
+                for inum in range(MAX_VM_IFACE):
+                    net_device_id = f'net{inum}'
+                    if net_device_id in vm_conf:
+                        self.make_vm_iface(commit, nvm, net_device_id, vm_conf[net_device_id], net_info=vm_netinfo, set_tag=set_tag)
 # теперь обновляем IP у ВМ
                 self.update_vm_ip(commit, nvm)
         result['vms'] = vm_count
@@ -865,13 +972,14 @@ class ProxmoxImport(Script):
         try:
             node_status = prox.nodes(node['node']).status.get()
         except:
-            self.log_warning(f"Ошибка запроса (недостаточные привилегии токена)!")
+            self.log_warning(f"Ошибка запроса API (недостаточные привилегии токена)!")
             return {'name':node_dev.name}
 #        self.log_debug(f"Node {node['node']}: {node_status}", node_dev)
         self.make_dev_ifaces(commit, prox, node, node_dev, set_tag=set_tag)
-# теперь обновляем хост (статус делаем 'online')
+# теперь обновляем хост
         self.update_device(commit, node_dev, d_role=self.get_device_role(False, name=DEVICE_ROLE_PBS), ip4=host_ip,
-                description=f"Proxmox BS {prox.version.get()['version']}, cpu={node_status['cpuinfo']['cpus']}, mem={int(int(node_status['memory']['total'])/1024**3)} GiB")
+                platform=f"{PLATFORM_PBS} {prox.version.get()['version']}",
+                description=f"PBS, vcpu={node_status['cpuinfo']['cpus']}, mem={round(int(node_status['memory']['total'])/1054500000/4)*4} GB")
         return {'name':node_dev.name}
 
 ################################################################################
@@ -887,12 +995,16 @@ class ProxmoxImport(Script):
         script_dev_type = self.get_device_type(commit, set_manufacturer=script_manuf, set_tag=script_tag)
         script_dev_role_pve = self.get_device_role(commit, name=DEVICE_ROLE_PVE, set_tag=script_tag)
         script_dev_role_pbs = self.get_device_role(commit, name=DEVICE_ROLE_PBS, set_tag=script_tag)
+        script_platform_pve = self.get_platform(commit, name=PLATFORM_PVE)
+        script_platform_pbs = self.get_platform(commit, name=PLATFORM_PBS)
         script_vm_role = self.get_device_role(commit, name=VM_DEFAULT_ROLE, set_tag=script_tag)
         script_cluster_type = self.get_cluster_type(commit, set_tag=script_tag)
         script_s_role = self.get_secret_role(commit, name=PROX_SECRET_ROLE, set_tag=script_tag)
 # проверяем
         if not (def_site and script_tag and script_manuf and script_dev_type and 
-                script_dev_role_pve and script_dev_role_pbs and script_vm_role and script_cluster_type):
+                script_dev_role_pve and script_dev_role_pbs and 
+                script_platform_pve and script_platform_pbs and 
+                script_vm_role and script_cluster_type):
             self.log_warning(f"Не созданы необходимые для работы объекты!")
             return
 
@@ -915,7 +1027,7 @@ class ProxmoxImport(Script):
                 m_key = my_ukey.get_master_key(private_key=priv_key)
 #                self.log_debug(f"Master_key: {m_key}")
                 if not m_key:
-                    self.log_failure(f"Загружен не соответствующий файл ключа!")
+                    self.log_failure(f"Загружен не соответствующий файл ключа! Нет доступа к Proxmox API.")
             else:
                 self.log_warning(f"Не загружен секретный ключ, нет доступа к Proxmox API.")
                 m_key = None
@@ -926,50 +1038,93 @@ class ProxmoxImport(Script):
 # составляем список проверяемых адресов
         ip_list = []
         for subnet in Prefix.objects.all():
-            if TAG_AUTO in [tag.name for tag in subnet.tags.all()]:	# только помеченные префиксы
+            if TAG_AUTO in [tag.name for tag in subnet.tags.all()]:	# только префиксы с тегом
                 ip_list.extend(subnet.get_child_ips())
         if len(ip_list)==0:
             self.log_warning(f"Не найдено адресов для сканирования в отмеченных подсетях!")
             return
         self.log_info(f"Проверяем IP: {ip_list[0]} - {ip_list[-1]}")
 
+# собираем записи ARP
+#        arp_out = subprocess.check_output(['cat','/proc/net/arp']).decode('utf-8')
+        arp_out = ('192.168.74.8 0x1 0x2 3e:ef:47:26:6b:88 * ens18 \n'
+'192.168.74.8 0x1 0x2 3e:ef:47:26:6b:88 * ens18 \n 192.168.74.17 0x1 0x2 32:5c:31:f7:4b:3e * ens18 \n'
+'192.168.74.31 0x1 0x2 bc:24:11:59:ae:b4 * ens18 \n 192.168.74.45 0x1 0x2 f8:cc:6e:03:ac:e3 * ens18 \n'
+'192.168.74.50 0x1 0x2 c6:fc:f2:17:22:7c * ens18 \n 192.168.74.192 0x1 0x2 02:e4:88:61:78:f8 * ens18 \n'
+'192.168.74.104 0x1 0x2 36:a5:b2:fd:a7:0f * ens18 \n 192.168.74.243 0x1 0x2 04:da:d2:13:c3:9f * ens18 \n'
+'192.168.74.248 0x1 0x2 bc:24:11:ee:c3:66 * ens18 \n 192.168.74.157 0x1 0x2 c2:7c:5a:43:90:c1 * ens18 \n'
+'192.168.74.171 0x1 0x2 b8:ce:f6:e1:3a:8d * ens18 \n 192.168.74.81 0x1 0x2 98:03:9b:62:77:15 * ens18 \n'
+'192.168.74.190 0x1 0x2 96:0d:08:c5:32:08 * ens18 \n 192.168.74.71 0x1 0x2 5e:ea:ae:2e:e5:5f * ens18 \n'
+'192.168.74.4 0x1 0x2 80:e8:6f:f1:3a:c1 * ens18 \n 192.168.74.27 0x1 0x2 bc:24:11:fc:24:11 * ens18 \n'
+'192.168.74.46 0x1 0x2 5a:81:30:00:bd:5d * ens18 \n 192.168.74.55 0x1 0x2 00:20:85:f7:88:bc * ens18 \n'
+'192.168.74.60 0x1 0x2 f4:6b:8c:2d:99:e8 * ens18 \n 192.168.74.153 0x1 0x2 16:d7:81:96:46:fc * ens18 \n'
+'192.168.74.172 0x1 0x2 f4:6b:8c:2d:98:9e * ens18 \n 192.168.74.181 0x1 0x2 84:f1:47:23:18:b9 * ens18 \n'
+'192.168.74.100 0x1 0x2 32:3f:f3:dc:95:e7 * ens18 \n 192.168.74.14 0x1 0x2 02:3b:cf:82:23:7f * ens18 \n'
+'192.168.74.23 0x1 0x2 00:25:90:18:38:59 * ens18 \n 192.168.74.51 0x1 0x2 2e:d6:3b:39:e6:f9 * ens18 \n'
+'192.168.74.56 0x1 0x2 8e:d1:21:d1:98:ce * ens18 \n 192.168.74.5 0x1 0x2 0c:c4:7a:4e:84:62 * ens18 \n'
+'192.168.74.254 0x1 0x2 d4:ae:52:c3:7c:5d * ens18 \n 192.168.74.135 0x1 0x2 00:1d:c3:00:be:ae * ens18 \n'
+'192.168.74.154 0x1 0x2 1e:0e:a1:5d:cf:5d * ens18 \n 192.168.74.182 0x1 0x2 00:1c:73:25:db:ad * ens18 \n'
+'192.168.74.191 0x1 0x2 9e:46:63:7d:16:d9 * ens18 \n 192.168.74.77 0x1 0x2 02:e2:3f:d6:97:5b * ens18 \n'
+'192.168.74.19 0x1 0x2 36:6b:7a:55:88:3b * ens18 \n 192.168.74.38 0x1 0x2 32:30:30:31:34:35 * ens18 \n'
+'192.168.74.52 0x1 0x2 a0:d3:c1:04:a8:c8 * ens18 \n 192.168.74.231 0x1 0x2 52:54:00:6e:df:e6 * ens18 \n'
+'192.168.74.78 0x1 0x2 bc:97:e1:e6:ec:b0 * ens18 \n 192.168.74.87 0x1 0x2 bc:24:11:05:e2:49 * ens18 \n'
+'192.168.74.101 0x1 0x2 ae:b7:71:b6:cf:cd * ens18 \n 192.168.74.1 0x1 0x2 b4:96:91:4d:50:9b * ens18 \n'
+'192.168.74.6 0x1 0x2 ae:08:04:18:54:15 * ens18 \n 192.168.74.34 0x1 0x2 00:25:90:13:91:de * ens18 \n'
+'192.168.74.57 0x1 0x2 1a:9d:8d:ab:cd:2a * ens18 \n 192.168.74.155 0x1 0x2 f6:00:51:41:5f:a6 * ens18 \n'
+'192.168.74.74 0x1 0x2 52:08:80:ce:dc:08 * ens18 \n 192.168.74.102 0x1 0x2 8a:7a:c7:15:25:f3 * ens18 \n'
+'192.168.74.2 0x1 0x2 00:25:90:18:3d:58 * ens18 \n 192.168.74.69 0x1 0x2 f6:f6:e9:ce:f0:b3 * ens18 \n'
+'192.168.74.44 0x1 0x2 00:30:48:7f:5f:04 * ens18 \n 192.168.74.242 0x1 0x2 bc:24:11:aa:2d:4f * ens18 \n'
+'192.168.74.251 0x1 0x2 98:03:9b:62:7a:25 * ens18 \n 192.168.74.128 0x1 0x2 ac:1f:6b:1b:d2:12 * ens18 \n'
+'192.168.74.137 0x1 0x2 e4:5a:d4:3e:b5:40 * ens18 \n 192.168.74.151 0x1 0x2 0a:4a:af:0b:a7:49 * ens18 \n'
+'192.168.74.70 0x1 0x2 b8:ce:f6:e1:3a:40 * ens18 \n 192.168.74.98 0x1 0x0 00:00:00:00:00:00 * ens18 \n'
+'192.168.74.12 0x1 0x2 00:25:90:2c:4f:bf * ens18 \n 192.168.74.26 0x1 0x2 e4:5a:d4:3e:bb:80 * ens18 \n'
+'192.168.74.40 0x1 0x2 f6:03:dc:3a:cf:04 * ens18 \n 192.168.74.205 0x1 0x0 00:00:00:00:00:00 * ens18 \n'
+'192.168.74.233 0x1 0x2 52:54:00:f5:b4:fe * ens18 \n 192.168.74.103 0x1 0x2 00:25:90:29:c3:78 * ens18 \n'
+'192.168.74.3 0x1 0x2 c2:7b:06:59:d9:20 * ens18'
+                )
+#        arp_out = '192.168.74.103 0x1 0x2 00:25:90:29:c3:78 * ens18 \n 192.168.74.55 0x1 0x2 00:20:85:f7:88:bc * ens18 \n 192.168.74.60 0x1 0x2 f4:6b:8c:2d:99:e8 * ens18 \n'
+#        self.log_debug(f'ARP output: {arp_out}')
+# из строк выбираем пары IPv4-MAC в словарь
+        self.ARP_Table = dict(re.findall(r'(\d{1,3}(?:[.]\d{1,3}){3}).+([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})', arp_out))
+#        self.log_debug(f'ARP table : {self.ARP_Table}')
+
 # основной цикл - перебираем адреса
         for addr in ip_list:
             if str(addr.status).lower() != 'active':	# все активные адреса из списка
                 continue
             s_name=addr.dns_name.split('.')[0]		# выбираем хост по DNS-адресу
-# проверяем порты Proxmox
-            ip4 = str(addr).split('/')[0]
-            if self.is_port_open(ip4, PVE_DEFAULT_PORT):
-                dev_role = script_dev_role_pve
-            elif self.is_port_open(ip4, PBS_DEFAULT_PORT):
-                dev_role = script_dev_role_pbs
-            else:
-# ищем в базе устройство
-                s_dev = self.get_device(False, name=s_name, site=def_site)
-                if s_dev:		# в списке есть, но Proxmox не отвечает
-                    self.log_debug(f"Device '{s_dev.name}' is offline.", s_dev)
+# проверяем порты Proxmox, прочие сервисы на этом адресе игнорируем
+            running_service = self.connect(addr)
+            dev_role = self.get_device_role(False, name=running_service) if running_service else None
+            if not dev_role:		# Proxmox не отвечает
+                s_dev = self.get_device(False, name=s_name, site=def_site)	# ищем в базе устройство
+                if s_dev and (s_dev.role==script_dev_role_pve or s_dev.role==script_dev_role_pbs):
+# в списке есть и это Proxmox
+                    self.log_info(f"Устройство '{s_dev.name}' отключено (не отвечает).", s_dev)
                     self.update_device(commit, s_dev, status=DeviceStatusChoices.STATUS_OFFLINE)
-                continue		# прочие сервисы на этом адресе игнорируем
-# создаем устройство
+                continue		# по этому адресу больше ничего не делаем
+# ищем/создаем устройство
             s_dev = self.get_device(commit, name=s_name, site=def_site, ipaddr=addr,
                                     status=DeviceStatusChoices.STATUS_ACTIVE,
                                     d_role=dev_role, d_type=script_dev_type, set_tag=script_tag)
             if not s_dev:		# создать не удалось?
                 continue
-# обновляем устройство
+# обновляем текущий статус устройства
             self.update_device(commit, s_dev, d_role=dev_role, status=DeviceStatusChoices.STATUS_ACTIVE)
-# пытаемся подключиться к Proxmox
+# теперь пытаемся подключиться к Proxmox по ключу в описании устройства
             prox = self.connect(addr, s_dev, m_key, script_s_role)
             if not prox:
                 continue
 # смотрим инфу Proxmox и обновляем хосты, интерфейсы, ВМ и прочее
             prox_version = prox.version.get()['version']
-            self.log_info(f"Анализ {prox._backend.auth.service} {prox_version} по адресу: {str(addr)}")
+            self.log_info(f"Анализ {prox._backend.auth.service} {prox_version} по адресу: {str(addr)}", s_dev)
             if prox._backend.auth.service==DEVICE_ROLE_PVE:
                 p_stat = self.check_pve(commit, prox, addr, site=def_site, set_tag=script_tag)
                 self.log_success(f"Анализ PVE '{p_stat['name']}' по адресу: {str(addr)} завершен. Nodes: {p_stat['nodes']}, VMs: {p_stat['vms']}", s_dev)
             else:
                 p_stat = self.check_pbs(commit, prox, s_dev, addr, set_tag=script_tag)
                 self.log_success(f"Анализ PBS '{p_stat['name']}' по адресу: {str(addr)} завершен.", s_dev)
+# обновляем счетчики интерфейсов
+        update_counts(Device, 'interface_count', 'interfaces')
+
         return
