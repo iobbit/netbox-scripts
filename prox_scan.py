@@ -15,7 +15,7 @@ from netbox.choices import ColorChoices
 from extras.scripts import Script, ObjectVar, FileVar
 from users.models import User
 from extras.models import Tag
-from virtualization.models import ClusterType, Cluster, VirtualMachine, VMInterface
+from virtualization.models import ClusterType, Cluster, VirtualMachine, VirtualMachineType, VMInterface
 from virtualization.choices import VirtualMachineStatusChoices, VirtualMachineStartOnBootChoices
 from dcim.choices import DeviceStatusChoices, InterfaceTypeChoices
 from dcim.models import Interface,MACAddress,Device,DeviceRole,DeviceType,Platform,Manufacturer,Site
@@ -38,6 +38,7 @@ PROX_COLOR_SERVER = ColorChoices.COLOR_TEAL
 # значения для автоматически добавляемых скриптом объектов
 DESC_STR = 'Создано скриптом '
 TAG_AUTO = 'prox_scan'		# метка для автоматически создаваемых объектов
+DEF_MANUFACTURER = 'ProxScan'	# условный изготовитель
 CLUSTER_TYPE = 'Proxmox'	# тип кластеров
 DEVICE_TYPE = 'ProxScan'	# тип устройств
 DEVICE_HEIGHT = 2.0		# размер (высота) стоечных устройств по умолчанию
@@ -46,7 +47,8 @@ PLATFORM_PVE = 'Proxmox VE'	# базовая платформа PVE
 DEVICE_ROLE_PBS = 'PBS'		# роль устройств Proxmox Backup Server
 PLATFORM_PBS = 'Proxmox BS'	# базовая платформа PBS
 VM_DEFAULT_ROLE = 'vm'		# роль по умолчанию для вирт.машин
-DEF_MANUFACTURER = 'ProxScan'	# условный изготовитель
+VM_TYPE_QEMU = 'QEMU'		# тип ВМ 'QEMU'
+VM_TYPE_LXC = 'LXC'		# тип ВМ 'LXC'
 
 # тип для физических интерфейсов
 IFACE_DEFAULT_TYPE = InterfaceTypeChoices.TYPE_1GE_TX_FIXED
@@ -241,7 +243,7 @@ class ProxmoxImport(Script):
                 d_type = DeviceType(
                     manufacturer = set_manufacturer,	# нужно проверять!
                     model = name,
-                    slug = name.lower(),
+                    slug = slugify(name),
                     u_height = units,
                     description = f"{DESC_STR}'{self.Meta.name}'",
                     )
@@ -253,6 +255,26 @@ class ProxmoxImport(Script):
                 return None
 #        self.log_debug(f"Device type ID: {d_type.id}, '{d_type.name}'", d_type)
         return d_type
+
+    def get_vm_type(self, commit, name, set_tag=None):
+        try:
+            vm_type = VirtualMachineType.objects.get(name=name)	# проверка наличия типа ВМ
+        except:
+            if commit:
+                self.log_success(f"Нет типа ВМ '{name}', создаем.")
+                vm_type = VirtualMachineType(
+                    name = name,
+                    slug = slugify(name),
+                    description = f"{DESC_STR}'{self.Meta.name}'",
+                    )
+                vm_type.full_clean()
+                vm_type.save()
+                if set_tag:
+                    vm_type.tags.add(set_tag)		# теги после создания объекта
+            else:
+                return None
+#        self.log_debug(f"VM type ID: {vm_type.id}, '{vm_type.name}'", vm_type)
+        return vm_type
 
     def get_secret_role(self, commit, name, set_tag=None):
         if not name:
@@ -501,8 +523,9 @@ class ProxmoxImport(Script):
         return True
 
 # поиск/создание/обновление виртуальной машины
-    def get_vm(self, commit, name, status, v_cluster, v_role=None, serial=None, onboot=False, platform=None,
-                    cpus=0, mem=0, disk=0, set_tag=None, description=None):
+    def get_vm(self, commit, name, status, v_cluster, vm_type=None, serial=None, onboot=False,
+                    platform=None, cpus=0, mem=0, disk=0, set_tag=None, description=None):
+        descr = description.replace('\n',' ')[:200]	# убираем переносы и обрезаем слишком большие 'Notes' из Proxmox
         try:
             vm = VirtualMachine.objects.get(cluster=v_cluster, name=name)	# проверка наличия ВМ в кластере
         except:
@@ -512,14 +535,15 @@ class ProxmoxImport(Script):
                     name = name,
                     status = status,
                     cluster = v_cluster,	# кластер виртуализации
-                    role = v_role if v_role else self.get_device_role(commit, name=VM_DEFAULT_ROLE, set_tag=set_tag),
+                    role = self.get_device_role(commit, name=VM_DEFAULT_ROLE, set_tag=set_tag),	# в Proxmox ролей нет, задаем при создании ВМ
+                    virtual_machine_type = vm_type,
                     serial = serial,
                     start_on_boot = VirtualMachineStartOnBootChoices.STATUS_ON if onboot else VirtualMachineStartOnBootChoices.STATUS_OFF,
                     platform = self.get_platform(commit, platform),
                     vcpus = cpus,
                     memory = mem,		# (MB)
                     disk = disk,		# (MB)
-                    description = description,
+                    description = descr,
                     comments = f"{DESC_STR}'{self.Meta.name}'",
                     )
                 vm.full_clean()
@@ -529,17 +553,19 @@ class ProxmoxImport(Script):
             else:
                 return None
         else:
-            self.update_vm(commit, vm, status, v_cluster, serial, onboot, platform, cpus, mem, disk, description)
+            self.update_vm(commit, vm, status, v_cluster, vm_type, serial, onboot, platform, cpus, mem, disk, descr)
 #        self.log_debug(f"VM ID: {vm.id}, '{vm.id}'", vm)
         return vm
 
-    def update_vm(self, commit, dev, status, v_cluster, vm_serial, onboot, platform, cpus, mem, disk, description):
-#        self.log_debug(f"ВМ {dev.id}: {dev.status}, cluster={dev.cluster}, ser={dev.serial}, onboot={dev.start_on_boot}, cpu={dev.vcpus}, mem={dev.memory}, disk={dev.disk}, {dev.description}")
+    def update_vm(self, commit, dev, status, v_cluster, vm_type, vm_serial, onboot, platform, cpus, mem, disk, description):
+#        self.log_debug(f"ВМ {dev.id}: {dev.status}, cluster={dev.cluster}, type={dev.virtual_machine_type},
+#                    ser={dev.serial}, onboot={dev.start_on_boot}, cpu={dev.vcpus}, mem={dev.memory}, disk={dev.disk}, {dev.description}")
         serial = str(vm_serial)
         vm_on_boot = VirtualMachineStartOnBootChoices.STATUS_ON if onboot else VirtualMachineStartOnBootChoices.STATUS_OFF
         upd = False
         upd = upd or (status and status != dev.status)
         upd = upd or (v_cluster and v_cluster != dev.cluster)
+        upd = upd or (vm_type and vm_type != dev.virtual_machine_type)
         upd = upd or (serial and serial != str(dev.serial))
         upd = upd or (vm_on_boot != dev.start_on_boot)
         upd = upd or (platform and (not dev.platform or platform != dev.platform.name))
@@ -558,6 +584,9 @@ class ProxmoxImport(Script):
         if v_cluster and v_cluster != dev.cluster:
             u_str.append(f"cluster={v_cluster}")
             dev.cluster = v_cluster
+        if vm_type and vm_type != dev.virtual_machine_type:
+            u_str.append(f"type={vm_type}")
+            dev.virtual_machine_type = vm_type
         if serial and (serial != str(dev.serial)):
             u_str.append(f"serial={serial}")
             dev.serial = serial
@@ -621,6 +650,19 @@ class ProxmoxImport(Script):
         else:
             size = int(size)	# Netbox считает диски в МБ
 #        self.log_debug(f"Disk size parsed: {conf_str} -> {size}")
+        return size
+
+# подсчет размера памяти виртуальной машины (МБ) или хоста (Б)
+    def calc_mem(self, vm, memstr):
+        if not memstr:
+            return None
+        if vm:
+            size=int(memstr)
+            if size>1000:
+                size=round(size/1024)*1000	# округляем до 1 GB
+        else:
+            size=round(int(memstr)/1054500000/4)*4	# округляем до 4 GB
+#        self.log_debug(f"{'VM' if vm else 'Host'} mem size parsed: {memstr} -> {size}")
         return size
 
 # подсчет размера дисков виртуальной машины по конфигурации
@@ -892,25 +934,27 @@ class ProxmoxImport(Script):
                             d_role=self.get_device_role(False, name=DEVICE_ROLE_PVE),
                             v_cluster=cluster, status=node_status,
                             platform=f"{PLATFORM_PVE} {prox.version.get()['version']}",
-                            description=f"PVE host, vcpu={node['maxcpu']}, mem={round(int(node['maxmem'])/1054500000/4)*4} GB")
+                            description=f"PVE host, vcpu={node['maxcpu']}, mem={self.calc_mem(False, node['maxmem'])} GB")
 
 # перебираем вирт.контейнеры
+            vmtype = self.get_vm_type(commit, name=VM_TYPE_LXC, set_tag=set_tag)
             for vm in prox.nodes(node['node']).lxc.get():
                 vm_count += 1
 #                self.log_debug(f"LXC {vm['name']}: {vm}")
                 vm_stat = VirtualMachineStatusChoices.STATUS_ACTIVE if vm['status'] == 'running' else VirtualMachineStatusChoices.STATUS_OFFLINE
                 vm_conf = prox.nodes(node['node']).lxc(vm['vmid']).config.get()
-                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
 #                self.log_debug(f"Conf {vm['name']}: {vm_conf}")
 # ostype: debian | devuan | ubuntu | centos | fedora | opensuse | archlinux | alpine | gentoo | nixos | unmanaged
                 if ('ostype' in vm_conf) and (vm_conf['ostype'] != 'unmanaged'):
                     vm_os = vm_conf['ostype'].capitalize()
                 else:
                     vm_os = None
-                descr = "тип=LXC"
+                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
+                descr = vm_conf['description'] if 'description' in vm_conf else ''
 # делаем/обновляем ВМ
-                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'], onboot=vm_onboot, platform=vm_os,
-                                cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
+                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, vm_type=vmtype, serial=vm['vmid'],
+                                onboot=vm_onboot, platform=vm_os, cpus=vm['cpus'],
+                                mem=self.calc_mem(True, vm_conf['memory'] if 'memory' in vm_conf else None),
                                 disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
@@ -923,6 +967,7 @@ class ProxmoxImport(Script):
                 self.update_vm_ip(commit, nvm)
 
 # перебираем вирт.машины
+            vmtype = self.get_vm_type(commit, name=VM_TYPE_QEMU, set_tag=set_tag)
             for vm in prox.nodes(node['node']).qemu.get():
                 vm_count += 1
                 vm_conf = prox.nodes(node['node']).qemu(vm['vmid']).config.get()
@@ -938,7 +983,6 @@ class ProxmoxImport(Script):
                 else:
                     vm_stat = VirtualMachineStatusChoices.STATUS_OFFLINE
                     vm_netinfo = None
-                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
 #                self.log_debug(f"Agent info {vm['name']}: {vm_netinfo}")
 # ostype: other=unspecified OS | wxp=Microsoft Windows XP | w2k=Microsoft Windows 2000 | w2k3=Microsoft Windows 2003
 #         w2k8=Microsoft Windows 2008 | wvista=Microsoft Windows Vista | win7=Microsoft Windows 7
@@ -948,10 +992,12 @@ class ProxmoxImport(Script):
                     vm_os = vm_conf['ostype'].capitalize()
                 else:
                     vm_os = None
-                descr = "тип=QEMU"
+                vm_onboot = vm_conf['onboot'] if 'onboot' in vm_conf else False
+                descr = vm_conf['description'] if 'description' in vm_conf else ''
 # делаем/обновляем ВМ
-                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, serial=vm['vmid'], onboot=vm_onboot, platform=vm_os,
-                                cpus=vm['cpus'], mem=int(vm_conf['memory'] if 'memory' in vm_conf else '512'),
+                nvm = self.get_vm(commit, vm['name'], vm_stat, cluster, vm_type=vmtype, serial=vm['vmid'],
+                                onboot=vm_onboot, platform=vm_os, cpus=vm['cpus'],
+                                mem=self.calc_mem(True, vm_conf['memory'] if 'memory' in vm_conf else None),
                                 disk=self.calc_disks(vm_conf), set_tag=set_tag, description=descr)
                 if not nvm:		# не удалось создать?
                     continue
@@ -979,7 +1025,7 @@ class ProxmoxImport(Script):
 # теперь обновляем хост
         self.update_device(commit, node_dev, d_role=self.get_device_role(False, name=DEVICE_ROLE_PBS), ip4=host_ip,
                 platform=f"{PLATFORM_PBS} {prox.version.get()['version']}",
-                description=f"PBS, vcpu={node_status['cpuinfo']['cpus']}, mem={round(int(node_status['memory']['total'])/1054500000/4)*4} GB")
+                description=f"PBS, vcpu={node_status['cpuinfo']['cpus']}, mem={self.calc_mem(False, node_status['memory']['total'])} GB")
         return {'name':node_dev.name}
 
 ################################################################################
@@ -998,12 +1044,15 @@ class ProxmoxImport(Script):
         script_platform_pve = self.get_platform(commit, name=PLATFORM_PVE)
         script_platform_pbs = self.get_platform(commit, name=PLATFORM_PBS)
         script_vm_role = self.get_device_role(commit, name=VM_DEFAULT_ROLE, set_tag=script_tag)
+        script_vm_type_qemu = self.get_vm_type(commit, name=VM_TYPE_QEMU, set_tag=script_tag)
+        script_vm_type_lxc = self.get_vm_type(commit, name=VM_TYPE_LXC, set_tag=script_tag)
         script_cluster_type = self.get_cluster_type(commit, set_tag=script_tag)
         script_s_role = self.get_secret_role(commit, name=PROX_SECRET_ROLE, set_tag=script_tag)
 # проверяем
         if not (def_site and script_tag and script_manuf and script_dev_type and 
                 script_dev_role_pve and script_dev_role_pbs and 
                 script_platform_pve and script_platform_pbs and 
+                script_vm_type_qemu and script_vm_type_lxc and 
                 script_vm_role and script_cluster_type):
             self.log_warning(f"Не созданы необходимые для работы объекты!")
             return
@@ -1126,5 +1175,8 @@ class ProxmoxImport(Script):
                 self.log_success(f"Анализ PBS '{p_stat['name']}' по адресу: {str(addr)} завершен.", s_dev)
 # обновляем счетчики интерфейсов
         update_counts(Device, 'interface_count', 'interfaces')
+        update_counts(VirtualMachine, 'interface_count', 'interfaces')
+# обновляем счетчики типов вирт.машин
+        update_counts(VirtualMachineType, 'virtual_machine_count', 'instances')
 
         return
