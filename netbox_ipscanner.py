@@ -4,12 +4,12 @@ from ipam.models import Prefix, IPAddress
 from extras.models import Tag
 from extras.scripts import Script, BooleanVar, StringVar, ObjectVar
 
-nmap_arguments = '-sn -PR -PE -PP -PS22,80,135,139,443,515,3389,9100 -PA22,80,113,443,3128,3389,8080 -T4'
+nmap_arguments = '-sn -PR -PE -PP -PS22,80,135,139,443,515,3389,8006,9100 -PA22,80,113,443,3128,3389,8006 -T3'
 #nmap_arguments = '-sn -PE -PP -PS22,80,135,139,443,515,3389,9100 -PA22,80,113,443,3389 -T3 --send-ip'
 #nmap_arguments = '-sn -PE -PP -PS21,22,23,25,80,113,443,31339 -PA80,113,443,10042 -T4 --source-port 53'        # рекомендовано nmap-docs
 #nmap_arguments = '-sn --send-ip -PR -PP -T2 --source-port 53'                  # длинные таймауты - находит почти всё (долго)
 
-DESC_STR = 'Автоматически добавлено скриптом '
+DESC_STR = 'Добавлено скриптом '
 
 class IpScan(Script):
     # optional variables in UI here!
@@ -31,7 +31,7 @@ class IpScan(Script):
         name = "IP Scanner"
         description = "Сканирует префиксы (с выбранной меткой или активные) и обновляет IPv4 адреса"
         commit_default = True
-        job_timeout = 900
+        job_timeout = 1200
 
     def run(self, data, commit):
 #        self.log_debug(f"Chosen '{data['select_tag']}' tag")
