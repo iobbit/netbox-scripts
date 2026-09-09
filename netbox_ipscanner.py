@@ -9,7 +9,7 @@ nmap_arguments = '-sn -PR -PE -PP -PS22,80,135,139,443,515,3389,8006,9100 -PA22,
 #nmap_arguments = '-sn -PE -PP -PS21,22,23,25,80,113,443,31339 -PA80,113,443,10042 -T4 --source-port 53'        # рекомендовано nmap-docs
 #nmap_arguments = '-sn --send-ip -PR -PP -T2 --source-port 53'                  # длинные таймауты - находит почти всё (долго)
 
-DESC_STR = 'Добавлено скриптом '
+COMMENT_STR = 'Добавлено скриптом '
 
 class IpScan(Script):
     # optional variables in UI here!
@@ -31,6 +31,7 @@ class IpScan(Script):
         name = "IP Scanner"
         description = "Сканирует префиксы (с выбранной меткой или активные) и обновляет IPv4 адреса"
         commit_default = True
+        notifications_default = 'never'
         job_timeout = 1200
 
     def run(self, data, commit):
@@ -82,7 +83,7 @@ class IpScan(Script):
             ip_address = IPAddress.objects.get(address=ipn)
 #            self.log_debug(f'IP: {ip_address.address}, Name: {ip_address.dns_name}, Desc: {ip_address.description}')
             if name and name.lower() != ip_address.dns_name:
-                self.log_success(f'Update {ipn}: {ip_address.dns_name} to {name}')
+                self.log_success(f'Update {ipn}: {ip_address.dns_name} to {name}', ip_address)
                 if commit:
                     if ip_address.pk and hasattr(ip_address, 'snapshot'):
                         ip_address.snapshot()
@@ -90,12 +91,14 @@ class IpScan(Script):
                     ip_address.full_clean()
                     ip_address.save()
         except IPAddress.DoesNotExist:
-            self.log_success(f'Adding new {ipn} = {name}')
             if commit:
                 new_address = IPAddress(
                     address = ipn,
                     dns_name = name,
-                    description = f"{DESC_STR}'{self.Meta.name}'",
+                    comments = f"{COMMENT_STR}'{self.Meta.name}'",
                     )
                 new_address.full_clean()
                 new_address.save()
+                self.log_success(f'Adding new {ipn} = {name}', new_address)
+            else:
+                self.log_success(f'Adding new {ipn} = {name}')
