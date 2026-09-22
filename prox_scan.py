@@ -65,7 +65,7 @@ MAX_VM_IFACE = 8
 # префикс для адресов из ARP-таблицы
 IP4_DEFAUT_PREFIX = '/24'
 
-PROX_TIMEOUT = 1		# default=5
+PROX_TIMEOUT = 0.8		# default=5
 PROX_TEST_TOKEN = 'test_token'	# в Proxmox API для проверки соединений, произвольно
 PROX_TOKEN_USER = 'root@pam'	# пользователь Proxmox API, без него не работает авторизация по токену
 
@@ -107,7 +107,7 @@ class ProxmoxImport(Script):
 #                self.log_debug(f'По адресу {ip_str} API создан! {api}')
                 try:
                     realms = api.access.domains.get()		# работает без аутентификации
-#                    self.log_debug(f'Успешно: {realms}')
+#                    self.log_debug(f'{ip_str} успешно: {realms}')
                     prox_service = srv
                     break
                 except AuthenticationError as e:		# требует аутентификации
@@ -391,7 +391,7 @@ class ProxmoxImport(Script):
         upd = False
         upd = upd or (d_role and d_role != dev.role)
         upd = upd or (v_cluster and v_cluster != dev.cluster)
-        upd = upd or (status and status != dev.status)
+        upd = upd or (status is not None and status != dev.status)
         upd = upd or (ip4 and ip4 != dev.primary_ip4)
         upd = upd or (platform and (not dev.platform or platform != dev.platform.name))
         upd = upd or (description and description != dev.description)
@@ -406,7 +406,7 @@ class ProxmoxImport(Script):
         if v_cluster and v_cluster != dev.cluster:
             u_str.append(f"cluster={v_cluster.name}")
             dev.cluster = v_cluster
-        if status and status != dev.status:
+        if status is not None and status != dev.status:
             u_str.append(f"status={status}")
             dev.status = status
         if platform and (not dev.platform or platform != dev.platform.name):
@@ -426,12 +426,12 @@ class ProxmoxImport(Script):
         dev.save()
         return True
 
-    def get_iface(self, commit, dev, name, iface_type=IFACE_DEFAULT_TYPE, mtu=None, iface_enabled=True, bridge_iface=None, set_tag=None):
+    def get_iface(self, commit, dev, name, iface_type=IFACE_DEFAULT_TYPE, mtu=None, iface_enabled=None, bridge_iface=None, set_tag=None):
         try:
             n_iface = Interface.objects.get(device=dev, name=name)	# проверка наличия интерфейса
         except:
             if commit:
-                self.log_success(f"Нет интерфейса '{name}', создаем.")
+                self.log_success(f"Нет интерфейса '{name}', создаем.", dev)
                 n_iface = Interface(
                     device = dev,
                     name = name,
@@ -454,22 +454,22 @@ class ProxmoxImport(Script):
 
     def update_dev_iface(self, commit, iface, iface_mtu, iface_enabled, iface_bridge):
         upd = False
-# обновляем MTU только если есть новое значение, уже установленное - не очищаем
+# обновляем только если есть новое значение, уже установленное - не очищаем
         upd = upd or iface_mtu and (str(iface_mtu) != str(iface.mtu))
-        upd = upd or (bool(iface_enabled) != iface.enabled)
-        upd = upd or (iface_bridge != iface.bridge)
+        upd = upd or (iface_enabled is not None) and (bool(iface_enabled) != iface.enabled)
+        upd = upd or iface_bridge and (iface_bridge != iface.bridge)
         if (not commit) or (not upd):
             return False
-        u_str =[]
+        u_str = []
         if iface.pk and hasattr(iface, 'snapshot'):
             iface.snapshot()		# запись для истории изменений
         if iface_mtu and (str(iface_mtu) != str(iface.mtu)):
             u_str.append(f"MTU={iface_mtu}")
             iface.mtu = iface_mtu
-        if bool(iface_enabled) != iface.enabled:
+        if (iface_enabled is not None) and (bool(iface_enabled) != iface.enabled):
             u_str.append(f"enabled={iface_enabled}")
             iface.enabled = bool(iface_enabled)
-        if iface_bridge != iface.bridge:
+        if iface_bridge and (iface_bridge != iface.bridge):
             u_str.append(f"bridge={iface_bridge}")
             iface.bridge = iface_bridge
         self.log_success(f"Обновляем интерфейс '{iface.name}': {', '.join(u_str)}", iface)
@@ -567,11 +567,11 @@ class ProxmoxImport(Script):
         serial = str(vm_serial)
         vm_on_boot = VirtualMachineStartOnBootChoices.STATUS_ON if onboot else VirtualMachineStartOnBootChoices.STATUS_OFF
         upd = False
-        upd = upd or (status and status != dev.status)
+        upd = upd or (status is not None and status != dev.status)
         upd = upd or (v_cluster and v_cluster != dev.cluster)
         upd = upd or (vm_type and vm_type != dev.virtual_machine_type)
         upd = upd or (serial and serial != str(dev.serial))
-        upd = upd or (vm_on_boot != dev.start_on_boot)
+        upd = upd or (vm_on_boot is not None and vm_on_boot != dev.start_on_boot)
         upd = upd or (platform and (not dev.platform or platform != dev.platform.name))
         upd = upd or (cpus and int(cpus) != int(dev.vcpus))		# в Proxmox сокеты в целых числах
         upd = upd or (mem and mem != dev.memory)
@@ -582,7 +582,7 @@ class ProxmoxImport(Script):
         u_str = []
         if dev.pk and hasattr(dev, 'snapshot'):
             dev.snapshot()		# запись для истории изменений
-        if status and status != dev.status:
+        if status is not None and status != dev.status:
             u_str.append(f"status={status}")
             dev.status = status
         if v_cluster and v_cluster != dev.cluster:
@@ -594,7 +594,7 @@ class ProxmoxImport(Script):
         if serial and (serial != str(dev.serial)):
             u_str.append(f"serial={serial}")
             dev.serial = serial
-        if vm_on_boot != dev.start_on_boot:
+        if vm_on_boot is not None and vm_on_boot != dev.start_on_boot:
             u_str.append(f"on_boot={vm_on_boot}")
             dev.start_on_boot = vm_on_boot
         if platform and (not dev.platform or platform != dev.platform.name):
@@ -755,7 +755,7 @@ class ProxmoxImport(Script):
 #        return f"{v_bridge}{DESC_STR}'{self.Meta.name}'"
         return v_bridge
 
-# поиск нужного атрибута в описании сети от qemu-агента
+# поиск нужного атрибута по MAC в описании сети от qemu-агента
     def parse_agent_netinfo(self, net_info, mac, attr):
         if not (net_info and mac):
             return None
@@ -765,12 +765,12 @@ class ProxmoxImport(Script):
             if attr=='name':
 #                self.log_debug(f"Agent Interface name: {vm_interface['name']}")
                 return vm_interface['name']
-            elif attr=='ip':
+            elif attr=='ip' and 'ip-addresses' in vm_interface:
                 iface_ip_list = []
                 for ip in vm_interface['ip-addresses']:		# собираем IP-адреса интерфейса
                     if ip['ip-address-type'] == 'ipv4':		# пропускаем IPv6
                         iface_ip_list.append(f"{ip['ip-address']}/{ip['prefix']}")
-# возвращаем список
+# возвращаем список IPv4-адресов
                 return iface_ip_list
         return None
 
@@ -868,23 +868,24 @@ class ProxmoxImport(Script):
 # перебираем интерфейсы хоста
         for iface in ifaces:
 #            self.log_debug(f"IFace {iface['iface']}: {iface}", node_dev)
-            i_status = ('active' in iface) and iface['active']
+            i_status = ('active' in iface) and bool(iface['active'])
             i_mtu = iface['mtu'] if 'mtu' in iface else None
-            i_bridge = None
-            if iface['type'] == 'eth':
+            if iface['type'] == 'eth' and self.real_iface(iface):	# смотрим только существующие в системе интерфейсы
                 i_type = IFACE_VIRTUAL_TYPE
 #                self.log_debug(f"Ethernet {iface['iface']}: active={i_status}, mtu={i_mtu}")
             elif iface['type'] == 'bridge':
                 i_type = IFACE_BRIDGE_TYPE
-                if 'bridge_ports' in iface:		# ищем порт 'eth' - должен уже существовать для привязки
-                    i_bridge = self.get_iface(False, node_dev, iface['bridge_ports'])
-#                self.log_debug(f"Bridge {iface['iface']}: bridge_ports={i_bridge}, active={i_status}, mtu={i_mtu}")
+#                self.log_debug(f"Bridge {iface['iface']}: bridge_ports={iface['bridge_ports']}, active={i_status}, mtu={i_mtu}")
             else:
                 i_type = IFACE_DEFAULT_TYPE
-                self.log_warning(f"Неизвестный тип интерфейса {iface['iface']}: {iface['type']}", node_dev)
+#                self.log_warning(f"Неизвестный тип интерфейса {iface['iface']}: {iface['type']}", node_dev)
+                continue
 # делаем/обновляем интерфейс
             dev_iface = self.get_iface(commit, node_dev, iface['iface'], iface_type=i_type,
-                                    mtu=i_mtu, iface_enabled=i_status, bridge_iface=i_bridge, set_tag=set_tag)
+                                    mtu=i_mtu, iface_enabled=i_status, set_tag=set_tag)
+            if 'bridge_ports' in iface and iface['bridge_ports']:	# ищем порт 'eth' - должен уже существовать для привязки
+                i_bridge = self.get_iface(commit, node_dev, iface['bridge_ports'], bridge_iface=dev_iface)
+#                self.log_debug(f"Привязка Eth {i_bridge} -> bridge_ports={dev_iface}", i_bridge)
             if 'cidr' in iface and dev_iface:
                 self.update_ip4(commit, dev_iface, iface['cidr'])
 # Proxmox не показывает MAC для интерфейсов хоста - берем из ARP-таблицы
@@ -895,6 +896,14 @@ class ProxmoxImport(Script):
 #                    self.log_debug(f"Link DEV iface '{dev_iface.name}' -> MAC={i_mac}", dev_iface)
                     self.update_mac(commit, dev_iface, i_mac)
         return True
+
+# проверка атрибутов интерфейса хоста
+    def real_iface(self, iface):
+        p1 = bool(('exists' in iface) and iface['exists'])
+        p2 = bool(('method' in iface) and iface['method'] == 'static')
+        p3 = bool(('cidr' in iface) and iface['cidr'])
+#        self.log_debug(f"Real {iface['iface']} : exists={p1}, static={p2}, cidr={p3} => {p1 or p2 or p3}")
+        return p1 or p2 or p3
 
 # проверка и обновление PVE
     def check_pve(self, commit, prox, host_ip, site, set_tag):
@@ -1101,41 +1110,74 @@ class ProxmoxImport(Script):
 # собираем записи ARP
 #        arp_out = subprocess.check_output(['cat','/proc/net/arp']).decode('utf-8')
         arp_out = (
-'192.168.74.51 0x1 0x2 2e:d6:3b:39:e6:f9 * ens18 \n 192.168.74.181 0x1 0x2 84:f1:47:23:18:b9 * ens18 \n'
-'192.168.74.55 0x1 0x2 00:20:85:f7:88:bc * ens18 \n 192.168.74.254 0x1 0x2 d4:ae:52:c3:7c:5d * ens18 \n'
-'192.168.74.128 0x1 0x2 ac:1f:6b:1b:d2:12 * ens18 \n 192.168.74.2 0x1 0x2 00:25:90:18:3d:58 * ens18 \n'
-'192.168.74.6 0x1 0x2 ae:08:04:18:54:15 * ens18 \n 192.168.74.71 0x1 0x2 5e:ea:ae:2e:e5:5f * ens18 \n'
-'192.168.74.14 0x1 0x2 02:3b:cf:82:23:7f * ens18 \n 192.168.74.18 0x1 0x2 bc:24:11:ca:ee:8f * ens18 \n'
-'192.168.74.87 0x1 0x2 bc:24:11:05:e2:49 * ens18 \n 192.168.74.26 0x1 0x2 e4:5a:d4:3e:bb:80 * ens18 \n'
-'192.168.74.34 0x1 0x2 00:25:90:13:91:de * ens18 \n 192.168.74.38 0x1 0x2 32:30:30:31:34:35 * ens18 \n'
-'192.168.74.103 0x1 0x2 00:25:90:29:c3:78 * ens18 \n 192.168.74.233 0x1 0x2 52:54:00:f5:b4:fe * ens18 \n'
-'192.168.74.172 0x1 0x2 f4:6b:8c:2d:98:9e * ens18 \n 192.168.74.46 0x1 0x2 5a:81:30:00:bd:5d * ens18 \n'
-'192.168.74.50 0x1 0x2 c6:fc:f2:17:22:7c * ens18 \n 192.168.74.184 0x1 0x2 90:54:b7:bb:70:c0 * ens18 \n'
-'192.168.74.192 0x1 0x2 02:e4:88:61:78:f8 * ens18 \n 192.168.74.1 0x1 0x2 b4:96:91:4d:50:9b * ens18 \n'
-'192.168.74.66 0x1 0x2 bc:24:11:6b:5d:d9 * ens18 \n 192.168.74.5 0x1 0x2 0c:c4:7a:4e:84:62 * ens18 \n'
-'192.168.74.70 0x1 0x2 b8:ce:f6:e1:3a:40 * ens18 \n 192.168.74.135 0x1 0x2 00:1d:c3:00:be:ae * ens18 \n'
-'192.168.74.74 0x1 0x2 52:08:80:ce:dc:08 * ens18 \n 192.168.74.78 0x1 0x2 bc:97:e1:e6:ec:b0 * ens18 \n'
-'192.168.74.17 0x1 0x2 32:5c:31:f7:4b:3e * ens18 \n 192.168.74.151 0x1 0x2 0a:4a:af:0b:a7:49 * ens18 \n'
-'192.168.74.155 0x1 0x2 f6:00:51:41:5f:a6 * ens18 \n 192.168.74.102 0x1 0x2 8a:7a:c7:15:25:f3 * ens18 \n'
-'192.168.74.171 0x1 0x2 b8:ce:f6:e1:3a:8d * ens18 \n 192.168.74.45 0x1 0x2 f8:cc:6e:03:ac:e3 * ens18 \n'
-'192.168.74.248 0x1 0x2 bc:24:11:ee:c3:66 * ens18 \n 192.168.74.57 0x1 0x2 1a:9d:8d:ab:cd:2a * ens18 \n'
-'192.168.74.191 0x1 0x2 9e:46:63:7d:16:d9 * ens18 \n 192.168.74.4 0x1 0x2 80:e8:6f:f1:3a:c1 * ens18 \n'
-'192.168.74.69 0x1 0x2 f6:f6:e9:ce:f0:b3 * ens18 \n 192.168.74.8 0x1 0x2 3e:ef:47:26:6b:88 * ens18 \n'
-'192.168.74.12 0x1 0x2 00:25:90:2c:4f:bf * ens18 \n 192.168.74.77 0x1 0x2 02:e2:3f:d6:97:5b * ens18 \n'
-'192.168.74.81 0x1 0x2 98:03:9b:62:77:15 * ens18 \n 192.168.74.154 0x1 0x2 1e:0e:a1:5d:cf:5d * ens18 \n'
-'192.168.74.101 0x1 0x2 ae:b7:71:b6:cf:cd * ens18 \n 192.168.74.231 0x1 0x2 52:54:00:6e:df:e6 * ens18 \n'
-'192.168.74.40 0x1 0x2 f6:03:dc:3a:cf:04 * ens18 \n 192.168.74.105 0x1 0x2 bc:24:11:12:04:b1 * ens18 \n'
-'192.168.74.44 0x1 0x2 00:30:48:7f:5f:04 * ens18 \n 192.168.74.243 0x1 0x2 04:da:d2:13:c3:9f * ens18 \n'
-'192.168.74.52 0x1 0x2 a0:d3:c1:04:a8:c8 * ens18 \n 192.168.74.182 0x1 0x2 00:1c:73:25:db:ad * ens18 \n'
-'192.168.74.56 0x1 0x2 8e:d1:21:d1:98:ce * ens18 \n 192.168.74.251 0x1 0x2 98:03:9b:62:7a:25 * ens18 \n'
-'192.168.74.60 0x1 0x2 f4:6b:8c:2d:99:e8 * ens18 \n 192.168.74.190 0x1 0x2 96:0d:08:c5:32:08 * ens18 \n'
-'192.168.74.3 0x1 0x2 c2:7b:06:59:d9:20 * ens18 \n 192.168.74.137 0x1 0x2 e4:5a:d4:3e:b5:40 * ens18 \n'
-'192.168.74.19 0x1 0x2 36:6b:7a:55:88:3b * ens18 \n 192.168.74.23 0x1 0x2 00:25:90:18:38:59 * ens18 \n'
-'192.168.74.153 0x1 0x2 16:d7:81:96:46:fc * ens18 \n 192.168.74.27 0x1 0x2 bc:24:11:fc:24:11 * ens18 \n'
-'192.168.74.157 0x1 0x2 c2:7c:5a:43:90:c1 * ens18 \n 192.168.74.31 0x1 0x2 bc:24:11:59:ae:b4 * ens18 \n'
-'192.168.74.100 0x1 0x2 32:3f:f3:dc:95:e7 * ens18 \n 192.168.74.104 0x1 0x2 36:a5:b2:fd:a7:0f * ens18 \n'
- )
-#        arp_out = '192.168.74.103 0x1 0x2 00:25:90:29:c3:78 * ens18 \n 192.168.74.55 0x1 0x2 00:20:85:f7:88:bc * ens18 \n 192.168.74.60 0x1 0x2 f4:6b:8c:2d:99:e8 * ens18 \n'
+' ens18 192.168.74.100 0x1 0x2 32:3f:f3:dc:95:e7 \n'
+' ens18 192.168.74.101 0x1 0x2 ae:b7:71:b6:cf:cd \n'
+' ens18 192.168.74.102 0x1 0x2 8a:7a:c7:15:25:f3 \n'
+' ens18 192.168.74.103 0x1 0x2 00:25:90:29:c3:78 \n'
+' ens18 192.168.74.104 0x1 0x2 36:a5:b2:fd:a7:0f \n'
+' ens18 192.168.74.105 0x1 0x2 bc:24:11:12:04:b1 \n'
+' ens18 192.168.74.1 0x1 0x2 b4:96:91:4d:50:9b \n'
+' ens18 192.168.74.12 0x1 0x2 00:25:90:2c:4f:bf \n'
+' ens18 192.168.74.128 0x1 0x2 ac:1f:6b:1b:d2:12 \n'
+' ens18 192.168.74.135 0x1 0x2 00:1d:c3:00:be:ae \n'
+' ens18 192.168.74.137 0x1 0x2 e4:5a:d4:3e:b5:40 \n'
+' ens18 192.168.74.14 0x1 0x2 02:3b:cf:82:23:7f \n'
+' ens18 192.168.74.151 0x1 0x2 0a:4a:af:0b:a7:49 \n'
+' ens18 192.168.74.153 0x1 0x2 16:d7:81:96:46:fc \n'
+' ens18 192.168.74.154 0x1 0x2 1e:0e:a1:5d:cf:5d \n'
+' ens18 192.168.74.155 0x1 0x2 f6:00:51:41:5f:a6 \n'
+' ens18 192.168.74.157 0x1 0x2 c2:7c:5a:43:90:c1 \n'
+' ens18 192.168.74.17 0x1 0x2 32:5c:31:f7:4b:3e \n'
+' ens18 192.168.74.171 0x1 0x2 b8:ce:f6:e1:3a:8d \n'
+' ens18 192.168.74.172 0x1 0x2 f4:6b:8c:2d:98:9e \n'
+' ens18 192.168.74.18 0x1 0x2 bc:24:11:ca:ee:8f \n'
+' ens18 192.168.74.181 0x1 0x2 84:f1:47:23:18:b9 \n'
+' ens18 192.168.74.182 0x1 0x2 00:1c:73:25:db:ad \n'
+' ens18 192.168.74.184 0x1 0x2 90:54:b7:bb:70:c0 \n'
+' ens18 192.168.74.190 0x1 0x2 96:0d:08:c5:32:08 \n'
+' ens18 192.168.74.19 0x1 0x2 36:6b:7a:55:88:3b \n'
+' ens18 192.168.74.191 0x1 0x2 9e:46:63:7d:16:d9 \n'
+' ens18 192.168.74.192 0x1 0x2 02:e4:88:61:78:f8 \n'
+' ens18 192.168.74.2 0x1 0x2 00:25:90:18:3d:58 \n'
+' ens18 192.168.74.23 0x1 0x2 00:25:90:18:38:59 \n'
+' ens18 192.168.74.231 0x1 0x2 52:54:00:6e:df:e6 \n'
+' ens18 192.168.74.233 0x1 0x2 52:54:00:f5:b4:fe \n'
+' ens18 192.168.74.243 0x1 0x2 04:da:d2:13:c3:9f \n'
+' ens18 192.168.74.248 0x1 0x2 bc:24:11:ee:c3:66 \n'
+' ens18 192.168.74.251 0x1 0x2 98:03:9b:62:7a:25 \n'
+' ens18 192.168.74.254 0x1 0x2 d4:ae:52:c3:7c:5d \n'
+' ens18 192.168.74.26 0x1 0x2 e4:5a:d4:3e:bb:80 \n'
+' ens18 192.168.74.27 0x1 0x2 bc:24:11:fc:24:11 \n'
+' ens18 192.168.74.28 0x1 0x2 bc:24:11:c8:09:f5 \n'
+' ens18 192.168.74.3 0x1 0x2 c2:7b:06:59:d9:20 \n'
+' ens18 192.168.74.31 0x1 0x2 bc:24:11:59:ae:b4 \n'
+' ens18 192.168.74.34 0x1 0x2 00:25:90:13:91:de \n'
+' ens18 192.168.74.38 0x1 0x2 32:30:30:31:34:35 \n'
+' ens18 192.168.74.40 0x1 0x2 f6:03:dc:3a:cf:04 \n'
+' ens18 192.168.74.4 0x1 0x2 80:e8:6f:f1:3a:c1 \n'
+' ens18 192.168.74.44 0x1 0x2 00:30:48:7f:5f:04 \n'
+' ens18 192.168.74.45 0x1 0x2 f8:cc:6e:03:ac:e3 \n'
+' ens18 192.168.74.46 0x1 0x2 5a:81:30:00:bd:5d \n'
+' ens18 192.168.74.50 0x1 0x2 c6:fc:f2:17:22:7c \n'
+' ens18 192.168.74.5 0x1 0x2 0c:c4:7a:4e:84:62 \n'
+' ens18 192.168.74.51 0x1 0x2 2e:d6:3b:39:e6:f9 \n'
+' ens18 192.168.74.52 0x1 0x2 a0:d3:c1:04:a8:c8 \n'
+' ens18 192.168.74.55 0x1 0x2 00:20:85:f7:88:bc \n'
+' ens18 192.168.74.56 0x1 0x2 8e:d1:21:d1:98:ce \n'
+' evice 192.168.74.57 0x1 0x2 1a:9d:8d:ab:cd:2a \n'
+' ens18 192.168.74.60 0x1 0x2 f4:6b:8c:2d:99:e8 \n'
+' ens18 192.168.74.6 0x1 0x2 ae:08:04:18:54:15 \n'
+' ens18 192.168.74.66 0x1 0x2 bc:24:11:6b:5d:d9 \n'
+' ens18 192.168.74.69 0x1 0x2 f6:f6:e9:ce:f0:b3 \n'
+' ens18 192.168.74.70 0x1 0x2 b8:ce:f6:e1:3a:40 \n'
+' ens18 192.168.74.71 0x1 0x2 5e:ea:ae:2e:e5:5f \n'
+' ens18 192.168.74.74 0x1 0x2 52:08:80:ce:dc:08 \n'
+' ens18 192.168.74.77 0x1 0x2 02:e2:3f:d6:97:5b \n'
+' ens18 192.168.74.78 0x1 0x2 bc:97:e1:e6:ec:b0 \n'
+' ens18 192.168.74.8 0x1 0x2 3e:ef:47:26:6b:88 \n'
+' ens18 192.168.74.81 0x1 0x2 98:03:9b:62:77:15 \n'
+' ens18 192.168.74.87 0x1 0x2 bc:24:11:05:e2:49 \n'
+        )
 #        self.log_debug(f'ARP output: {arp_out}')
 # из строк выбираем пары IPv4-MAC в словарь
         self.ARP_Table = dict(re.findall(r'(\d{1,3}(?:[.]\d{1,3}){3}).+([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})', arp_out))
