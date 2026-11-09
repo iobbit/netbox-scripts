@@ -782,22 +782,30 @@ class ProxmoxImport(Script):
     def update_vm_iface(self, commit, iface, iface_name, iface_mtu, iface_enabled, iface_bridge):
         upd = False
         upd = upd or (iface_name and iface_name != iface.name)
-        upd = upd or (iface_mtu and int(iface_mtu) != iface.mtu) or (not iface_mtu and iface.mtu)
+        upd = upd or (iface_mtu and int(iface_mtu) != int(iface.mtu)) or (not iface_mtu and iface.mtu)
         upd = upd or (bool(iface_enabled) != iface.enabled)
         upd = upd or (iface.description != self.make_vm_iface_description(iface_bridge))
         if (not commit) or (not upd):
             return False
-        self.log_success(f"Обновляем интерфейс ВМ {iface.name}: {iface_name}, mtu={iface_mtu}, enabled={iface_enabled}, bridge={iface_bridge}", iface)
+        u_str = []
         if iface.pk and hasattr(iface, 'snapshot'):
             iface.snapshot()		# запись для истории изменений
-        if iface_name:
+        if iface_name and iface_name != iface.name:
+            u_str.append(f"name='{iface_name}'")
             iface.name = iface_name
-        if iface_mtu:
+        if iface_mtu and int(iface_mtu) != int(iface.mtu):
+            u_str.append(f"MTU={int(iface_mtu)}")
             iface.mtu = int(iface_mtu)
-        else:
+        if not iface_mtu and iface.mtu:
+            u_str.append(f"MTU=None")
             iface.mtu = None
-        iface.enabled = bool(iface_enabled)
-        iface.description = self.make_vm_iface_description(iface_bridge)
+        if bool(iface_enabled) != iface.enabled:
+            u_str.append(f"enabled={bool(iface_enabled)}")
+            iface.enabled = bool(iface_enabled)
+        if iface.description != self.make_vm_iface_description(iface_bridge):
+            u_str.append(f"bridge={iface_bridge}")
+            iface.description = self.make_vm_iface_description(iface_bridge)
+        self.log_success(f"Обновляем интерфейс ВМ {iface.name}: {', '.join(u_str)}", iface)
         iface.full_clean()
         iface.save()
         return True
